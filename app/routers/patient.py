@@ -1,10 +1,21 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from ..database import get_db
-from ..models.models import PatientMedicineGuide
-from ..schemas.schemas import MedicineGuideOut, LaymanStudyExplanationRequest, LaymanStudyExplanationOut
+from ..models.models import PatientMedicineGuide, PatientMedication, User
+from ..schemas.schemas import MedicineGuideOut, LaymanStudyExplanationRequest, LaymanStudyExplanationOut, RegimenAnalysisOut
 from ..services.auth_service import get_client_ip, patient_explain_rate_limiter
+from ..services.safety_service import MultiDrugSafetyService
+from ..dependencies.auth import get_current_active_user
+
+
+class PatientMedicationCreate(BaseModel):
+    drug_name: str = Field(..., min_length=1, max_length=255)
+    dosage: Optional[str] = "As prescribed"
+    frequency: Optional[str] = "Daily"
+    time_of_day: Optional[str] = "Morning (8:00 AM)"
+    notes: Optional[str] = None
 
 router = APIRouter(prefix="/patient", tags=["Patient Portal — Plain Language Health Education"])
 
@@ -92,3 +103,134 @@ def get_patient_overview(db: Session = Depends(get_db)):
         ],
         "safe_health_notice": "CureNova Patient Portal provides plain-language educational material. No speculative research candidate is presented as a medical recommendation."
     }
+
+@router.get("/regimen")
+def get_patient_regimen(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Retrieves authenticated patient's persistent medication regimen."""
+    meds = db.query(PatientMedication).filter(PatientMedication.user_id == current_user.id).order_by(PatientMedication.created_at.asc()).all()
+    return [
+        {
+            "id": m.id,
+            "drug_name": m.drug_name,
+            "dosage": m.dosage,
+            "frequency": m.frequency,
+            "time_of_day": m.time_of_day,
+            "taken": m.taken,
+            "notes": m.notes,
+            "created_at": m.created_at.isoformat() if hasattr(m.created_at, "isoformat") else str(m.created_at)
+        }
+        for m in meds
+    ]
+
+@router.post("/regimen")
+def add_patient_medication(
+    med: PatientMedicationCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Adds a medication to authenticated patient's persistent regimen."""
+    clean_name = med.drug_name.strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Drug name cannot be empty.")
+    
+    existing = db.query(PatientMedication).filter(
+        PatientMedication.user_id == current_user.id,
+        PatientMedication.drug_name.ilike(clean_name)
+    ).first()
+    if existing:
+        return {
+            "id": existing.id,
+            "drug_name": existing.drug_name,
+            "dosage": existing.dosage,
+            "frequency": existing.frequency,
+            "time_of_day": existing.time_of_day,
+            "taken": existing.taken,
+            "message": "Medication already present in regimen."
+        }
+    
+    new_med = PatientMedication(
+        user_id=current_user.id,
+        drug_name=clean_name,
+        dosage=med.dosage or "As prescribed",
+        frequency=med.frequency or "Daily",
+        time_of_day=med.time_of_day or "Morning (8:00 AM)",
+        taken=False,
+        notes=med.notes
+    )
+    db.add(new_med)
+    db.commit()
+    db.refresh(new_med)
+    return {
+        "id": new_med.id,
+        "drug_name": new_med.drug_name,
+        "dosage": new_med.dosage,
+        "frequency": new_med.frequency,
+        "time_of_day": new_med.time_of_day,
+        "taken": new_med.taken,
+        "message": "Medication added to persistent regimen."
+    }
+
+@router.delete("/regimen/{med_id}")
+def remove_patient_medication(
+    med_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Removes a medication from authenticated patient's persistent regimen."""
+    med = db.query(PatientMedication).filter(
+        PatientMedication.id == med_id,
+        PatientMedication.user_id == current_user.id
+    ).first()
+    if not med:
+        raise HTTPException(status_code=404, detail="Medication not found in regimen.")
+    db.delete(med)
+    db.commit()
+    return {"status": "success", "message": "Medication removed."}
+
+@router.post("/regimen/{med_id}/toggle")
+def toggle_patient_dose(
+    med_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Toggles daily dose taken status."""
+    med = db.query(PatientMedication).filter(
+        PatientMedication.id == med_id,
+        PatientMedication.user_id == current_user.id
+    ).first()
+    if not med:
+        raise HTTPException(status_code=404, detail="Medication not found in regimen.")
+    med.taken = not med.taken
+    db.commit()
+    db.refresh(med)
+    return {"id": med.id, "drug_name": med.drug_name, "taken": med.taken}
+
+@router.post("/regimen/safety-check", response_model=RegimenAnalysisOut)
+def check_patient_regimen_safety(
+    medications: Optional[List[str]] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Evaluates authenticated patient's active medication regimen for dangerous
+    polypharmacy interactions and contraindications.
+    If no explicit list is provided, automatically evaluates the user's stored medications.
+    """
+    if medications and len(medications) > 0:
+        eval_list = medications
+    else:
+        user_meds = db.query(PatientMedication).filter(
+            PatientMedication.user_id == current_user.id
+        ).all()
+        eval_list = [m.drug_name for m in user_meds]
+
+    return MultiDrugSafetyService.analyze_regimen(
+        db=db,
+        medications=eval_list,
+        patient_context={"patient_id": current_user.id, "patient_name": current_user.full_name}
+    )
+
+

@@ -29,7 +29,7 @@ MODEL_VERSION = "cure-nova-xgb-final"
 
 # Import runtime components
 try:
-    from .predict_v4 import predict as _raw_predict
+    from .predict_v4 import predict as _raw_predict, predict_for_drug as _raw_predict_drug
     from .evidence_utils import (
         get_drug_evidence,
         get_chembl_live_evidence,
@@ -38,7 +38,7 @@ try:
     from .stress_test import run_stress_test
 except ImportError:
     # Allow running directly as standalone script
-    from predict_v4 import predict as _raw_predict
+    from predict_v4 import predict as _raw_predict, predict_for_drug as _raw_predict_drug
     from evidence_utils import (
         get_drug_evidence,
         get_chembl_live_evidence,
@@ -150,6 +150,32 @@ def predict_and_enrich(disease_id: str, top_k: int = 10) -> Dict[str, Any]:
     return result
 
 
+def predict_candidates_for_drug(drug_id: str, top_k: int = 10) -> Dict[str, Any]:
+    """
+    Queries candidate disease pairs for a drug and ranks them using the production XGBoost model.
+    """
+    return _raw_predict_drug(drug_id=drug_id, top_k=top_k)
+
+
+def predict_and_enrich_for_drug(drug_id: str, top_k: int = 10) -> Dict[str, Any]:
+    """
+    End-to-end ML pipeline for drug query:
+    1. XGBoost candidate disease ranking
+    2. Open Targets evidence retrieval for drug
+    3. ChEMBL evidence retrieval for drug
+    4. Robustness stress test
+    """
+    result = predict_candidates_for_drug(drug_id=drug_id, top_k=top_k)
+    candidates = result.get("candidates", [])
+
+    enriched = []
+    for candidate in candidates:
+        enriched.append(enrich_candidate(candidate))
+
+    result["candidates"] = enriched
+    return result
+
+
 class CureNovaMLPredictor:
     """Class wrapper for CureNova ML inference engine."""
 
@@ -164,6 +190,12 @@ class CureNovaMLPredictor:
         if enrich:
             return predict_and_enrich(disease_id=disease_id, top_k=top_k)
         return predict_candidates(disease_id=disease_id, top_k=top_k)
+
+    @classmethod
+    def predict_drug(cls, drug_id: str, top_k: int = 10, enrich: bool = True) -> Dict[str, Any]:
+        if enrich:
+            return predict_and_enrich_for_drug(drug_id=drug_id, top_k=top_k)
+        return predict_candidates_for_drug(drug_id=drug_id, top_k=top_k)
 
     @classmethod
     def stress_test(cls, candidate: Dict[str, Any]) -> Dict[str, Any]:

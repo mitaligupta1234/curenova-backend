@@ -54,7 +54,7 @@ export const EvidenceExplorer = () => {
         source: source !== 'all' ? source : undefined,
         evidence_type: evidenceType !== 'all' ? evidenceType : undefined,
       });
-      setRecords(res.results || []);
+      setRecords(Array.isArray(res) ? res : (res.results || []));
     } catch {
       setError('Unable to reach evidence repository. Please retry.');
     } finally {

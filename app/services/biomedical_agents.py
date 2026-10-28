@@ -238,6 +238,114 @@ class SafetyAssessor:
         return safety_assessment
 
 
+class ChallengeAgent:
+    """
+    Agent E: Adversarial Challenge & Verification Agent.
+    Audits candidate hypotheses by actively searching for contradictory evidence,
+    unfavorable pharmacological profiles, lack of mechanistic target overlap,
+    and robustness stress test penalties.
+    Enforces scientific rigor by surfacing failure modes rather than just confirming hypotheses.
+    """
+    @staticmethod
+    async def run(
+        drug_name: str,
+        disease_name: str,
+        top_candidate: Optional[CandidatePrediction],
+        evidence_facts: List[Dict[str, Any]],
+        llm_client: Optional[BaseLLMClient] = None
+    ) -> Dict[str, Any]:
+        challenges: List[str] = []
+        validation_requirements: List[str] = []
+        stress_flags: List[str] = []
+        robustness_score: float = 75.0
+
+        # 1. Stress test heuristic audit
+        if top_candidate:
+            stress = getattr(top_candidate, "stress_test", {}) or {}
+            stress_score = getattr(top_candidate, "stress_score", None) or stress.get("overall_score")
+            if stress_score is not None:
+                robustness_score = float(stress_score)
+            stress_flags = getattr(top_candidate, "stress_flags", []) or stress.get("flags", [])
+            stress_interp = getattr(top_candidate, "stress_interpretation", "") or stress.get("interpretation", "")
+
+            if "NO_TARGET_OVERLAP" in stress_flags:
+                challenges.append(
+                    f"Direct Mechanistic Challenge: No verified direct target overlap between {drug_name} and primary {disease_name} pathology targets in Open Targets curated data."
+                )
+                validation_requirements.append(
+                    f"In vitro kinase/receptor assay screening to verify direct binding of {drug_name} against {disease_name} key effectors."
+                )
+
+            if "NO_TARGET_ASSOCIATION" in stress_flags:
+                challenges.append(
+                    f"Evidence Association Gap: Lacks direct genetic association score in Open Targets platform."
+                )
+
+            if robustness_score < 40.0:
+                challenges.append(
+                    f"Low Heuristic Robustness ({robustness_score:.1f}/100): High vulnerability to target or pathway perturbation in stress testing ({stress_interp})."
+                )
+
+        # 2. Contradictory evidence audit
+        contradictory = [e for e in evidence_facts if e.get("evidence_direction") == "contradictory"]
+        for c in contradictory:
+            challenges.append(
+                f"Contradictory Literature: {c.get('title')} reported opposing or negative experimental endpoints."
+            )
+            validation_requirements.append(
+                f"Resolution of contradictory findings reported in {c.get('journal', 'literature')} (PMID: {c.get('pmid', 'N/A')})."
+            )
+
+        # 3. Clinical translation challenge
+        validation_requirements.append(
+            "Pharmacokinetic/pharmacodynamic (PK/PD) profiling to ensure therapeutically achievable concentrations at target disease tissue."
+        )
+
+        challenge_report = {
+            "drug_name": drug_name,
+            "disease_name": disease_name,
+            "robustness_score": robustness_score,
+            "stress_flags": stress_flags,
+            "challenges": challenges if challenges else [
+                f"Hypothesis is based on computational ranking and preclinical target similarity; clinical efficacy in {disease_name} remains unproven."
+            ],
+            "validation_requirements": validation_requirements,
+            "adversarial_audit_status": "COMPLETED",
+            "audit_disclaimer": "Adversarial challenge assessment designed to prevent confirmation bias. Surfacing failure modes is required for robust translational research."
+        }
+
+        if llm_client:
+            system_prompt = (
+                "You are CureNova ChallengeAgent, an adversarial scientific auditor and devil's advocate. "
+                "Your objective is to identify potential failure modes, contradictory mechanisms, toxicity risks, "
+                "and translational hurdles for the proposed drug repurposing hypothesis. "
+                "Do NOT accept the hypothesis blindly. Actively challenge assumptions and specify necessary verification experiments. "
+                "Return JSON with keys: challenges (list of str), validation_requirements (list of str)."
+            )
+            user_prompt = (
+                f"<candidate>\nDrug: {drug_name}\nDisease: {disease_name}\n</candidate>\n"
+                f"<stress_flags>\n{json.dumps(stress_flags)}\n</stress_flags>\n"
+                f"<known_challenges>\n{json.dumps(challenges)}\n</known_challenges>"
+            )
+            try:
+                llm_out = await llm_client.chat_completion(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    temperature=0.3,
+                    max_tokens=600,
+                    response_json=True
+                )
+                if isinstance(llm_out, dict):
+                    if "challenges" in llm_out and isinstance(llm_out["challenges"], list):
+                        challenge_report["challenges"] = list(dict.fromkeys(challenges + [str(x) for x in llm_out["challenges"]]))
+                    if "validation_requirements" in llm_out and isinstance(llm_out["validation_requirements"], list):
+                        challenge_report["validation_requirements"] = list(dict.fromkeys(validation_requirements + [str(x) for x in llm_out["validation_requirements"]]))
+            except Exception as e:
+                logger.warning("ChallengeAgent LLM challenge failure: %s", str(e))
+
+        return challenge_report
+
+
 class Synthesizer:
     """
     Agent D: Synthesizer.
@@ -252,6 +360,7 @@ class Synthesizer:
         evidence_facts: List[Dict[str, Any]],
         mechanistic_data: Dict[str, Any],
         safety_data: Dict[str, Any],
+        challenge_data: Optional[Dict[str, Any]] = None,
         llm_client: Optional[BaseLLMClient] = None
     ) -> StructuredSynthesisOut:
         # Build set of valid evidence IDs that actually exist
@@ -262,8 +371,15 @@ class Synthesizer:
         rationale = f"Evaluated repurposing potential of {drug_name} for {disease_name} across {len(evidence_facts)} evidence records."
         supp_ids = [i for i in mechanistic_data.get("supporting_evidence_ids", []) if i in valid_ids]
         conf_ids = [i for i in safety_data.get("contradictory_evidence_ids", []) if i in valid_ids]
-        safety_concerns = safety_data.get("safety_concerns", [])
-        missing_info = safety_data.get("missing_safety_data", [])
+        safety_concerns = list(safety_data.get("safety_concerns", []))
+        missing_info = list(safety_data.get("missing_safety_data", []))
+
+        if challenge_data:
+            for ch in challenge_data.get("challenges", []):
+                safety_concerns.append(f"Adversarial Challenge: {ch}")
+            for vr in challenge_data.get("validation_requirements", []):
+                missing_info.append(f"Required Verification: {vr}")
+
         strength = "Moderate (Phase 2/Clinical)" if any("clinical" in str(e.get("study_type", "")).lower() for e in evidence_facts) else "Preliminary Preclinical"
 
         rejected_ids: List[int] = []

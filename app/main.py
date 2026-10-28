@@ -83,8 +83,9 @@ def direct_me(current_user=Depends(auth.get_current_active_user)):
 @app.get("/api/investigate", tags=["Candidate Hypotheses"])
 async def direct_investigate(
     query: str,
+    search_type: str = "drug_to_disease",
     db: Session = Depends(get_db),
     current_user=Depends(candidates.require_researcher)
 ):
     """Direct alias for /api/candidates/investigate."""
-    return await candidates.investigate_query(query=query, db=db, current_user=current_user)
+    return await candidates.investigate_query(query=query, search_type=search_type, db=db, current_user=current_user)

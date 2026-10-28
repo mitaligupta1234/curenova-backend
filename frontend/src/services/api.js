@@ -23,18 +23,39 @@ const api = axios.create({
 api.interceptors.request.use(
   (config) => {
     const token = localStorage.getItem('curenova_token');
-    if (token) {
-      config.headers.Authorization = `Bearer ${token}`;
+    if (token && token.trim()) {
+      const cleanToken = token.trim();
+      if (config.headers && typeof config.headers.set === 'function') {
+        config.headers.set('Authorization', `Bearer ${cleanToken}`);
+      } else {
+        config.headers = config.headers || {};
+        config.headers.Authorization = `Bearer ${cleanToken}`;
+      }
     }
     return config;
   },
   (error) => Promise.reject(error)
 );
 
-// Intercept responses for consistent error formatting and session expiration detection
+let isRefreshing = false;
+let failedQueue = [];
+
+const processQueue = (error, token = null) => {
+  failedQueue.forEach((prom) => {
+    if (error) {
+      prom.reject(error);
+    } else {
+      prom.resolve(token);
+    }
+  });
+  failedQueue = [];
+};
+
+// Intercept responses for consistent error formatting and automatic session renewal
 api.interceptors.response.use(
   (response) => response.data,
-  (error) => {
+  async (error) => {
+    const originalRequest = error.config;
     const status = error.response?.status;
     const detail = error.response?.data?.detail;
     const message =
@@ -43,9 +64,77 @@ api.interceptors.response.use(
       error.message ||
       'Biomedical intelligence service temporarily unavailable.';
 
-    // Clear stale session on 401 when token was rejected
-    if (status === 401 && localStorage.getItem('curenova_token')) {
-      console.warn('Session expired or unauthorized request:', message);
+    // Check if error is 401 and request can be refreshed
+    const url = originalRequest?.url || '';
+    const isAuthRequest = url.includes('/auth/login') || url.includes('/auth/refresh') || url.includes('/auth/logout');
+
+    if (status === 401 && originalRequest && !originalRequest._retry && !isAuthRequest) {
+      const storedRefresh = localStorage.getItem('curenova_refresh_token');
+
+      if (storedRefresh) {
+        if (isRefreshing) {
+          return new Promise((resolve, reject) => {
+            failedQueue.push({ resolve, reject });
+          })
+            .then((newToken) => {
+              if (originalRequest.headers && typeof originalRequest.headers.set === 'function') {
+                originalRequest.headers.set('Authorization', `Bearer ${newToken}`);
+              } else {
+                originalRequest.headers = originalRequest.headers || {};
+                originalRequest.headers.Authorization = `Bearer ${newToken}`;
+              }
+              return api(originalRequest);
+            })
+            .catch((err) => Promise.reject(err));
+        }
+
+        originalRequest._retry = true;
+        isRefreshing = true;
+
+        try {
+          // Direct axios call to avoid interceptor recursion
+          const refreshRes = await axios.post(
+            `${API_BASE_URL}/auth/refresh`,
+            { refresh_token: storedRefresh },
+            { headers: { 'Content-Type': 'application/json' } }
+          );
+
+          const { access_token, refresh_token: newRefreshToken } = refreshRes.data;
+          if (access_token) {
+            localStorage.setItem('curenova_token', access_token);
+            if (newRefreshToken) {
+              localStorage.setItem('curenova_refresh_token', newRefreshToken);
+            }
+            if (originalRequest.headers && typeof originalRequest.headers.set === 'function') {
+              originalRequest.headers.set('Authorization', `Bearer ${access_token}`);
+            } else {
+              originalRequest.headers = originalRequest.headers || {};
+              originalRequest.headers.Authorization = `Bearer ${access_token}`;
+            }
+            processQueue(null, access_token);
+            return api(originalRequest);
+          }
+        } catch (refreshErr) {
+          processQueue(refreshErr, null);
+          localStorage.removeItem('curenova_token');
+          localStorage.removeItem('curenova_refresh_token');
+          localStorage.removeItem('curenova_user');
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('curenova:session-expired'));
+          }
+          return Promise.reject(new Error('Session expired. Please log in again to continue your research.'));
+        } finally {
+          isRefreshing = false;
+        }
+      } else {
+        // No refresh token available; clear stale credentials
+        localStorage.removeItem('curenova_token');
+        localStorage.removeItem('curenova_refresh_token');
+        localStorage.removeItem('curenova_user');
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('curenova:session-expired'));
+        }
+      }
     }
 
     return Promise.reject(new Error(message));
@@ -86,40 +175,64 @@ export const adminService = {
 
 export const repurposingService = {
   getDiseases: () => api.get('/candidates'),
-  analyze: async (query, minEvidence = 'all') => {
+  analyze: async (query, minEvidence = 'all', searchType = 'drug_to_disease') => {
     const cleanQuery = encodeURIComponent(query.trim());
-    const raw = await api.post(`/candidates/investigate?query=${cleanQuery}`);
+    const cleanSearchType = encodeURIComponent(searchType || 'drug_to_disease');
+    const raw = await api.post(`/candidates/investigate?query=${cleanQuery}&search_type=${cleanSearchType}`, {});
     const synthesis = raw.structured_synthesis || {};
+    const effectiveSearchType = raw.search_type || searchType;
+    const isDrugFirst = effectiveSearchType === 'drug_to_disease' || raw.query_type === 'drug';
 
     return {
       analysis_id: raw.workflow_id,
       workflow_id: raw.workflow_id,
       query: query,
-      disease_detected: raw.query_entity,
+      search_type: effectiveSearchType,
+      query_type: raw.query_type || (isDrugFirst ? 'drug' : 'disease'),
+      disease_detected: isDrugFirst ? (raw.candidate_hypotheses?.[0]?.disease_name || 'Multiple Indications') : raw.query_entity,
       query_entity: raw.query_entity,
+      queried_entity: raw.queried_entity || { name: raw.query_entity, type: raw.entity_type, query_type: raw.query_type },
       entity_type: raw.entity_type,
-      candidates: (raw.candidate_hypotheses || []).map((c, idx) => ({
-        id: c.id,
-        drug_name: c.drug_name,
-        original_indication: c.approval_status || 'Preclinical Repurposing Hypothesis',
-        curenova_ranking: Math.round((c.prediction_score || 0.85) * 100),
-        prediction_score: c.prediction_score,
-        confidence_interval: `[${(c.confidence_interval_low ?? 0.70).toFixed(2)}, ${(c.confidence_interval_high ?? 0.95).toFixed(2)}]`,
-        confidence_interval_low: c.confidence_interval_low,
-        confidence_interval_high: c.confidence_interval_high,
-        evidence_strength: c.evidence_count >= 3 ? 'high' : c.evidence_count >= 1 ? 'moderate' : 'low',
-        evidence_count: c.evidence_count,
-        mechanism_summary: c.rationale || c.biological_mechanism || synthesis.proposed_mechanism || 'Target kinase signaling modulation',
-        evidence_passages: synthesis.validated_citations || [],
-        safety_signals: synthesis.safety_concerns || [],
-        missing_data: synthesis.missing_information || [],
-        epistemic_uncertainty: c.epistemic_uncertainty,
-        aleatoric_uncertainty: c.aleatoric_uncertainty,
-        calibration_status: c.calibration_status,
-        is_bookmarked: c.is_bookmarked,
-        rank: c.rank || idx + 1,
-        status: c.status,
-      })),
+      ml_prediction_metadata: raw.ml_prediction_metadata || {},
+      candidates: (raw.candidate_hypotheses || []).map((c, idx) => {
+        const candidateDisplayName = isDrugFirst ? (c.disease_name || c.candidate_name) : (c.drug_name || c.candidate_name);
+        const subtitle = isDrugFirst
+          ? `Investigated Drug: ${c.drug_name || raw.query_entity}`
+          : (c.approval_status || 'Preclinical Repurposing Hypothesis');
+
+        return {
+          id: c.id,
+          candidate_name: candidateDisplayName,
+          candidate_label: isDrugFirst ? 'Proposed Indication' : 'Candidate Drug',
+          drug_name: c.drug_name,
+          disease_name: c.disease_name,
+          original_indication: isDrugFirst ? (c.approval_status || 'Proposed Indication') : (c.approval_status || 'Preclinical Repurposing Hypothesis'),
+          display_title: candidateDisplayName,
+          display_subtitle: subtitle,
+          curenova_ranking: c.prediction_score != null ? Math.round(c.prediction_score * 100) : null,
+          prediction_score: c.prediction_score,
+          score_type: c.score_type,
+          ml_score_available: c.ml_score_available !== false && c.score_type !== 'curated_evidence_benchmark',
+          confidence_interval: c.confidence_interval_low != null && c.confidence_interval_high != null
+            ? `[${c.confidence_interval_low.toFixed(2)}, ${c.confidence_interval_high.toFixed(2)}]`
+            : 'N/A',
+          confidence_interval_low: c.confidence_interval_low,
+          confidence_interval_high: c.confidence_interval_high,
+          evidence_strength: c.evidence_count >= 3 ? 'high' : c.evidence_count >= 1 ? 'moderate' : 'low',
+          evidence_count: c.evidence_count,
+          mechanism_summary: c.rationale || c.biological_mechanism || synthesis.proposed_mechanism || 'Target kinase signaling modulation',
+          biological_mechanism: c.biological_mechanism,
+          evidence_passages: synthesis.validated_citations || [],
+          safety_signals: synthesis.safety_concerns || [],
+          missing_data: synthesis.missing_information || [],
+          epistemic_uncertainty: c.epistemic_uncertainty,
+          aleatoric_uncertainty: c.aleatoric_uncertainty,
+          calibration_status: c.calibration_status,
+          is_bookmarked: c.is_bookmarked,
+          rank: c.rank || idx + 1,
+          status: c.status,
+        };
+      }),
       synthesis_report: raw.synthesis_report,
       completed_steps: raw.completed_steps || [],
       provenance_mode: raw.provenance_mode,
@@ -129,6 +242,8 @@ export const repurposingService = {
     };
   },
   getResult: (id) => api.get(`/candidates/${id}`),
+  getInvestigation: (workflowId) => api.get(`/candidates/investigation/${workflowId}`),
+  listInvestigations: (limit = 20) => api.get('/candidates/investigations', { params: { limit } }),
   toggleBookmark: (id) => api.post(`/candidates/${id}/bookmark`),
   addNote: (candidateId, content) => api.post(`/candidates/${candidateId}/notes`, { content }),
   deleteNote: (noteId) => api.delete(`/candidates/notes/${noteId}`),
@@ -138,44 +253,61 @@ export const safetyService = {
   getCatalog: () => api.get('/patient/medicines'),
   analyze: async (medications, patientContext = null, roleView = 'doctor') => {
     const medList = Array.isArray(medications) ? medications : [medications];
-    const names = medList
+    const medNames = medList
       .map((m) => (typeof m === 'string' ? m : m.name || m.drug_name || ''))
-      .filter(Boolean)
-      .join(',');
+      .filter(Boolean);
 
-    const ddis = await api.get('/doctor/interactions', {
-      params: names ? { drug_names: names } : {},
-    });
+    try {
+      const endpoint = roleView === 'patient' ? '/patient/regimen/safety-check' : '/doctor/safety/analyze-regimen';
+      const res = await api.post(endpoint, {
+        medications: medNames,
+        patient_context: patientContext,
+      });
+      return {
+        ...res,
+        medications: medList,
+        patient_context: patientContext,
+        role_view: roleView,
+      };
+    } catch (err) {
+      // Fallback query to /doctor/interactions if analyze-regimen is unavailable
+      const names = medNames.join(',');
+      const ddis = await api.get('/doctor/interactions', {
+        params: names ? { drug_names: names } : {},
+      });
 
-    const ddiArray = Array.isArray(ddis) ? ddis : [];
-    const hasMajor = ddiArray.some(
-      (d) => d.severity?.toLowerCase() === 'contraindicated' || d.severity?.toLowerCase() === 'major'
-    );
+      const ddiArray = Array.isArray(ddis) ? ddis : [];
+      const hasMajor = ddiArray.some(
+        (d) => d.severity?.toLowerCase() === 'contraindicated' || d.severity?.toLowerCase() === 'major'
+      );
 
-    return {
-      analysis_id: `safe-${Date.now()}`,
-      overall_risk_category: hasMajor ? 'High Risk' : (ddiArray.length > 0 ? 'Moderate Risk' : 'Low Risk'),
-      overall_risk_score: hasMajor ? 82 : (ddiArray.length > 0 ? 50 : 12),
-      summary_headline: ddiArray.length > 0
-        ? `Identified ${ddiArray.length} potential interaction signal(s) among evaluated medications.`
-        : 'No critical drug-drug interactions detected in curated pharmacovigilance database.',
-      pairwise_interactions: ddiArray.map((d) => ({
-        drug_a: d.drug_a,
-        drug_b: d.drug_b,
-        severity: d.severity,
-        mechanism: d.mechanism,
-        clinical_recommendation: d.recommendation,
-        source: d.verified_source,
-        url: d.source_url,
-      })),
-      medications: medList,
-      patient_context: patientContext,
-      role_view: roleView,
-    };
+      return {
+        analysis_id: `safe-${Date.now()}`,
+        overall_risk_category: hasMajor ? 'High Risk' : (ddiArray.length > 0 ? 'Moderate Risk' : 'Low Risk'),
+        overall_risk_score: hasMajor ? 75.0 : (ddiArray.length > 0 ? 35.0 : 0.0),
+        summary_headline: ddiArray.length > 0
+          ? `Identified ${ddiArray.length} potential interaction signal(s) among evaluated medications.`
+          : 'No critical drug-drug interactions detected in curated pharmacovigilance database.',
+        pairwise_interactions: ddiArray.map((d) => ({
+          drug_a: d.drug_a,
+          drug_b: d.drug_b,
+          severity: d.severity,
+          mechanism: d.mechanism,
+          clinical_recommendation: d.recommendation,
+          source: d.verified_source,
+          url: d.source_url,
+        })),
+        unmonitored_pairs: [],
+        medications: medList,
+        patient_context: patientContext,
+        role_view: roleView,
+      };
+    }
   },
   getResult: (id) => api.get('/doctor/overview'),
   getTrials: (params) => api.get('/doctor/clinical-trials', { params }),
   getLiveTrials: (params) => api.get('/doctor/clinical-trials/live', { params }),
+  getAdverseEvents: (drug, limit = 5) => api.get('/doctor/adverse-events', { params: { drug, limit } }),
   simulateTwin: async (baselineMedications, addedDrugs = [], removedDrugs = [], patientContext = null) => {
     const combined = [
       ...baselineMedications.filter((m) => !removedDrugs.includes(m)),
@@ -183,6 +315,17 @@ export const safetyService = {
     ];
     return safetyService.analyze(combined, patientContext, 'doctor');
   },
+};
+
+export const patientService = {
+  getMedicines: (search) => api.get('/patient/medicines', { params: search ? { search } : {} }),
+  getMedicineGuide: (name) => api.get(`/patient/medicines/${encodeURIComponent(name)}`),
+  getRegimen: () => api.get('/patient/regimen'),
+  addMedication: (data) => api.post('/patient/regimen', data),
+  removeMedication: (id) => api.delete(`/patient/regimen/${id}`),
+  toggleDose: (id) => api.post(`/patient/regimen/${id}/toggle`),
+  explainResearch: (data) => api.post('/patient/explain-research', data),
+  getOverview: () => api.get('/patient/overview'),
 };
 
 export const evidenceService = {

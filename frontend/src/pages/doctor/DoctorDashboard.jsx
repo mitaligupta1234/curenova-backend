@@ -84,7 +84,7 @@ export const DoctorDashboard = () => {
     safetyService
       .getCatalog()
       .then((res) => {
-        setCatalog(res.catalog || []);
+        setCatalog(Array.isArray(res) ? res : (res.catalog || []));
       })
       .catch((err) => console.error('Failed to load drug catalog', err))
       .finally(() => setLoadingCatalog(false));
@@ -94,6 +94,30 @@ export const DoctorDashboard = () => {
   const enabledMeds = useMemo(() => {
     return activeDrugs.filter((d) => d.enabled).map((d) => d.name);
   }, [activeDrugs]);
+
+  // Live real backend pairwise interactions check
+  const [backendDdis, setBackendDdis] = useState([]);
+  const [unmonitoredPairs, setUnmonitoredPairs] = useState([]);
+  const [backendSafetyData, setBackendSafetyData] = useState(null);
+
+  useEffect(() => {
+    if (enabledMeds.length >= 2) {
+      safetyService
+        .analyze(enabledMeds)
+        .then((data) => {
+          setBackendDdis(data.pairwise_interactions || []);
+          setUnmonitoredPairs(data.unmonitored_pairs || []);
+          setBackendSafetyData(data);
+        })
+        .catch((err) => {
+          console.warn('Real-time backend DDI check skipped:', err);
+        });
+    } else {
+      setBackendDdis([]);
+      setUnmonitoredPairs([]);
+      setBackendSafetyData(null);
+    }
+  }, [enabledMeds]);
 
   // Toggle drug inclusion in simulation
   const toggleDrug = (name) => {
@@ -117,7 +141,7 @@ export const DoctorDashboard = () => {
     setActiveDrugs(activeDrugs.filter((d) => d.name !== name));
   };
 
-  // Dynamic Live Safety Vitals calculation
+  // Dynamic Live Safety Vitals calculation using real backend DDI service
   const vitals = useMemo(() => {
     const count = enabledMeds.length;
     if (count === 0) {
@@ -133,23 +157,41 @@ export const DoctorDashboard = () => {
       };
     }
 
-    const medsLower = enabledMeds.map((m) => m.toLowerCase());
     let penalty = 0;
     let highRiskCount = 0;
     let modRiskCount = 0;
 
-    // Check all pairwise combinations
-    for (let i = 0; i < medsLower.length; i++) {
-      for (let j = i + 1; j < medsLower.length; j++) {
-        const pair = `${medsLower[i]}-${medsLower[j]}`;
-        if (KNOWN_INTERACTIONS[pair]) {
-          const item = KNOWN_INTERACTIONS[pair];
-          if (item.severity === 'Severe') {
-            penalty += 35;
-            highRiskCount++;
-          } else {
-            penalty += 18;
-            modRiskCount++;
+    // Check real backend pairwise DDIs from database first
+    if (backendDdis.length > 0) {
+      for (const ddi of backendDdis) {
+        const sev = (ddi.severity || '').toLowerCase();
+        if (sev === 'contraindicated' || sev === 'severe' || sev === 'major') {
+          penalty += 35;
+          highRiskCount++;
+        } else {
+          penalty += 18;
+          modRiskCount++;
+        }
+      }
+    } else if (backendSafetyData?.overall_risk_score !== undefined) {
+      penalty = (backendSafetyData.overall_risk_score / 100) * 80;
+      highRiskCount = backendSafetyData.contraindications_count || 0;
+      modRiskCount = (backendSafetyData.major_interactions_count || 0) + (backendSafetyData.moderate_interactions_count || 0);
+    } else {
+      // Fallback check all pairwise combinations against known dictionary
+      const medsLower = enabledMeds.map((m) => m.toLowerCase());
+      for (let i = 0; i < medsLower.length; i++) {
+        for (let j = i + 1; j < medsLower.length; j++) {
+          const pair = `${medsLower[i]}-${medsLower[j]}`;
+          if (KNOWN_INTERACTIONS[pair]) {
+            const item = KNOWN_INTERACTIONS[pair];
+            if (item.severity === 'Severe') {
+              penalty += 35;
+              highRiskCount++;
+            } else {
+              penalty += 18;
+              modRiskCount++;
+            }
           }
         }
       }
@@ -165,17 +207,17 @@ export const DoctorDashboard = () => {
     // Age penalty
     if (patientAge > 75) penalty += 8;
 
-    const rawScore = Math.max(15, 96 - penalty);
+    const rawScore = Math.max(15, Math.round(96 - penalty));
     const renalCapacity = Math.max(20, Math.min(100, Math.round((patientEgfr / 90) * 100) - (penalty > 20 ? 15 : 0)));
     const hepaticCapacity = Math.max(30, 95 - count * 6 - (highRiskCount > 0 ? 15 : 0));
     const cardiacTolerance = Math.max(25, 95 - (highRiskCount > 0 ? 30 : 5) - (patientAge > 70 ? 10 : 0));
 
     let riskStatus = 'Optimal';
     let riskColor = 'emerald';
-    if (rawScore < 45) {
+    if (highRiskCount > 0 || rawScore < 45) {
       riskStatus = 'Severe Hazard';
       riskColor = 'rose';
-    } else if (rawScore < 75) {
+    } else if (modRiskCount > 0 || rawScore < 75) {
       riskStatus = 'Moderate Alert';
       riskColor = 'amber';
     }
@@ -190,7 +232,7 @@ export const DoctorDashboard = () => {
       highRiskCount,
       modRiskCount,
     };
-  }, [enabledMeds, patientEgfr, patientAge]);
+  }, [enabledMeds, patientEgfr, patientAge, backendDdis, backendSafetyData]);
 
   return (
     <div className="space-y-8 w-full text-left">
@@ -440,7 +482,8 @@ export const DoctorDashboard = () => {
                 <div className="flex items-center gap-2 text-[10px] font-mono">
                   <span className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-rose-500" /> Severe</span>
                   <span className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-amber-500" /> Moderate</span>
-                  <span className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-emerald-500" /> Safe</span>
+                  <span className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-slate-400" /> Unmonitored</span>
+                  <span className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-emerald-500" /> Documented Safe</span>
                 </div>
               </div>
 
@@ -468,7 +511,25 @@ export const DoctorDashboard = () => {
                         {enabledMeds.map((colMed, colIdx) => {
                           const isSelf = rowIdx === colIdx;
                           const pairKey = `${rowMed.toLowerCase()}-${colMed.toLowerCase()}`;
-                          const interaction = KNOWN_INTERACTIONS[pairKey];
+                          const backendMatch = backendDdis.find(
+                            (d) =>
+                              (d.drug_a?.toLowerCase() === rowMed.toLowerCase() && d.drug_b?.toLowerCase() === colMed.toLowerCase()) ||
+                              (d.drug_b?.toLowerCase() === rowMed.toLowerCase() && d.drug_a?.toLowerCase() === colMed.toLowerCase())
+                          );
+                          const fallbackMatch = KNOWN_INTERACTIONS[pairKey];
+                          const interaction = backendMatch
+                            ? {
+                                severity: ['contraindicated', 'major', 'severe'].includes(backendMatch.severity?.toLowerCase()) ? 'Severe' : 'Moderate',
+                                score: ['contraindicated', 'major', 'severe'].includes(backendMatch.severity?.toLowerCase()) ? 85 : 55,
+                                alert: backendMatch.mechanism || backendMatch.clinical_recommendation || 'Documented drug-drug interaction',
+                                source: backendMatch.verified_source || 'Curated Monograph',
+                              }
+                            : fallbackMatch;
+                          const isUnmonitored = !interaction && unmonitoredPairs.some(
+                            (u) =>
+                              (u.drug_a?.toLowerCase() === rowMed.toLowerCase() && u.drug_b?.toLowerCase() === colMed.toLowerCase()) ||
+                              (u.drug_b?.toLowerCase() === rowMed.toLowerCase() && u.drug_a?.toLowerCase() === colMed.toLowerCase())
+                          );
                           const isSelected = activeCell?.row === rowMed && activeCell?.col === colMed;
 
                           return (
@@ -488,12 +549,37 @@ export const DoctorDashboard = () => {
                                 >
                                   !
                                 </button>
+                              ) : isUnmonitored ? (
+                                <button
+                                  type="button"
+                                  onClick={() => setActiveCell({
+                                    row: rowMed,
+                                    col: colMed,
+                                    severity: 'Unmonitored',
+                                    alert: 'No interaction documented in curated monographs. Absence of record does NOT guarantee clinical safety.',
+                                    source: 'Unmonitored Pair'
+                                  })}
+                                  className={`w-7 h-7 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 border border-slate-200 dark:border-slate-700 font-mono text-[10px] hover:scale-105 cursor-pointer ${
+                                    isSelected ? 'ring-2 ring-[#0284C7] dark:ring-[#38BDF8] scale-110' : ''
+                                  }`}
+                                  title={`${rowMed} + ${colMed}: Unmonitored (Absence of record does not guarantee safety)`}
+                                >
+                                  ?
+                                </button>
                               ) : (
                                 <button
                                   type="button"
-                                  onClick={() => setActiveCell({ row: rowMed, col: colMed, severity: 'Safe', alert: 'No documented clinical interaction' })}
-                                  className="w-7 h-7 rounded-lg bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-700/60 font-mono text-[10px] hover:scale-105 cursor-pointer"
-                                  title={`${rowMed} + ${colMed}: Safe`}
+                                  onClick={() => setActiveCell({
+                                    row: rowMed,
+                                    col: colMed,
+                                    severity: 'Documented Safe',
+                                    alert: 'No interaction documented in current pharmacovigilance monographs.',
+                                    source: 'Prescribing Monograph'
+                                  })}
+                                  className={`w-7 h-7 rounded-lg bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-700/60 font-mono text-[10px] hover:scale-105 cursor-pointer ${
+                                    isSelected ? 'ring-2 ring-[#0284C7] dark:ring-[#38BDF8] scale-110' : ''
+                                  }`}
+                                  title={`${rowMed} + ${colMed}: Documented Safe`}
                                 >
                                   ✓
                                 </button>
@@ -511,14 +597,27 @@ export const DoctorDashboard = () => {
               {activeCell && (
                 <div className="p-3 rounded-2xl bg-[var(--color-surface-sunken)] border border-[var(--color-border-strong)] flex items-center justify-between animate-in fade-in">
                   <div className="flex items-center gap-2.5">
-                    <span className={`w-2.5 h-2.5 rounded-full ${activeCell.severity === 'Severe' ? 'bg-rose-500' : activeCell.severity === 'Moderate' ? 'bg-amber-500' : 'bg-emerald-500'}`} />
+                    <span className={`w-2.5 h-2.5 rounded-full ${
+                      activeCell.severity === 'Severe'
+                        ? 'bg-rose-500'
+                        : activeCell.severity === 'Moderate'
+                        ? 'bg-amber-500'
+                        : activeCell.severity === 'Unmonitored'
+                        ? 'bg-slate-400'
+                        : 'bg-emerald-500'
+                    }`} />
                     <div>
                       <span className="text-xs font-bold text-[var(--color-text-primary)]">
-                        {activeCell.row} + {activeCell.col}
+                        {activeCell.row} + {activeCell.col} {activeCell.severity ? `(${activeCell.severity})` : ''}
                       </span>
                       <span className="text-[11px] text-[var(--color-text-muted)] block">
                         {activeCell.alert}
                       </span>
+                      {activeCell.source && (
+                        <span className="text-[10px] text-blue-600 dark:text-blue-400 block mt-0.5">
+                          Source: {activeCell.source}
+                        </span>
+                      )}
                     </div>
                   </div>
                   <button

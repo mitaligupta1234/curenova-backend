@@ -1,8 +1,9 @@
+import json
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from ..database import get_db
-from ..models.models import CandidatePrediction, ResearchNote, EvidenceRecord, User
+from ..models.models import CandidatePrediction, ResearchNote, EvidenceRecord, User, InvestigationRun
 from ..schemas.schemas import (
     CandidateSummaryOut, CandidateDetailOut, ResearchNoteCreate, ResearchNoteOut,
     AgentWorkflowResponse
@@ -47,10 +48,13 @@ def get_candidates(
 
     return query.all()
 
+VALID_SEARCH_TYPES = {"drug_to_disease", "disease_to_drug"}
+
 @router.post("/investigate", response_model=AgentWorkflowResponse)
 @router.get("/investigate", response_model=AgentWorkflowResponse)
 async def investigate_query(
     query: str = Query(..., min_length=2, max_length=150, description="Disease or Drug to investigate"),
+    search_type: str = Query("drug_to_disease", description="Search direction: 'drug_to_disease' or 'disease_to_drug'"),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_researcher)
 ):
@@ -58,6 +62,7 @@ async def investigate_query(
     Executes the Agentic Orchestrator multi-step research workflow.
     Restricted strictly to approved researchers and administrators.
     Derives principal role from verified authenticated user identity.
+    Supports drug_to_disease (default) and disease_to_drug workflows.
     """
     clean_query = query.strip()
     if not clean_query:
@@ -66,13 +71,68 @@ async def investigate_query(
             detail="Investigation query cannot be blank or whitespace-only."
         )
 
+    clean_search_type = search_type.strip().lower() if search_type else "drug_to_disease"
+    if clean_search_type not in VALID_SEARCH_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid search_type '{search_type}'. Supported values are 'drug_to_disease' and 'disease_to_drug'."
+        )
+
     result = await AgenticOrchestrator.run_investigation(
         db=db,
         query=clean_query,
+        search_type=clean_search_type,
         user_role=current_user.role,
-        demo_mode=settings.DEMO_MODE
+        demo_mode=settings.DEMO_MODE,
+        user_id=current_user.id
     )
     return result
+
+
+@router.get("/investigations", response_model=List[Dict[str, Any]])
+def list_investigations(
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Returns past persisted investigation runs."""
+    runs = db.query(InvestigationRun).order_by(InvestigationRun.created_at.desc()).limit(limit).all()
+    return [
+        {
+            "workflow_id": r.workflow_id,
+            "query": r.query,
+            "entity_resolved_name": r.entity_resolved_name,
+            "entity_type": r.entity_type,
+            "candidate_count": r.candidate_count,
+            "top_candidate_name": r.top_candidate_name,
+            "top_candidate_score": r.top_candidate_score,
+            "provenance_mode": r.provenance_mode,
+            "created_at": r.created_at.isoformat() if hasattr(r.created_at, "isoformat") else str(r.created_at)
+        }
+        for r in runs
+    ]
+
+
+@router.get("/investigation/{workflow_id}", response_model=AgentWorkflowResponse)
+def get_investigation_by_id(
+    workflow_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user)
+):
+    """Retrieves a previously computed investigation run by workflow_id."""
+    run = db.query(InvestigationRun).filter(InvestigationRun.workflow_id == workflow_id).first()
+    if not run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Investigation run '{workflow_id}' not found."
+        )
+    try:
+        return json.loads(run.results_json)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Corrupt investigation payload: {exc}"
+        )
 
 
 @router.get("/{candidate_id}", response_model=CandidateDetailOut)

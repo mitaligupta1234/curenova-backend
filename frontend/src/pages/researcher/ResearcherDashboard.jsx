@@ -22,12 +22,20 @@ export const ResearcherDashboard = () => {
   const { user } = useAuth();
   const navigate = useNavigate();
 
+  const DRUG_BENCHMARK_EXAMPLES = [
+    "Metformin",
+    "Fasudil",
+    "Everolimus",
+    "Niclosamide",
+    "Imatinib"
+  ];
+
   // Load real diseases and examples from backend API
   const [diseases, setDiseases] = useState([]);
   const [loading, setLoading] = useState(true);
   const [selectedDisease, setSelectedDisease] = useState(null);
   const [expandedInfo, setExpandedInfo] = useState(false);
-  const [exampleQueries, setExampleQueries] = useState([]);
+  const [exampleQueries, setExampleQueries] = useState(DRUG_BENCHMARK_EXAMPLES);
   const [quickQuery, setQuickQuery] = useState('');
 
   // Real stored user research runs from localStorage
@@ -39,7 +47,9 @@ export const ResearcherDashboard = () => {
       .then((res) => {
         const loadedDiseases = res.diseases || [];
         setDiseases(loadedDiseases);
-        setExampleQueries(res.example_queries || []);
+        if (res.example_queries && res.example_queries.length > 0) {
+          setExampleQueries(res.example_queries);
+        }
         if (loadedDiseases.length > 0) {
           setSelectedDisease(loadedDiseases[0]);
         }
@@ -60,7 +70,9 @@ export const ResearcherDashboard = () => {
   const handleQuickSubmit = (e) => {
     e.preventDefault();
     if (quickQuery.trim()) {
-      navigate('/researcher/drug-repurposing', { state: { prefilledQuery: quickQuery.trim() } });
+      navigate('/researcher/drug-repurposing', {
+        state: { prefilledQuery: quickQuery.trim(), prefilledMode: 'drug-to-disease' }
+      });
     }
   };
 
@@ -153,10 +165,10 @@ export const ResearcherDashboard = () => {
           <div className="p-6 rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 shadow-sm space-y-4">
             <div>
               <h2 className="text-base font-bold text-gray-900 dark:text-gray-100">
-                Investigate Pathology or Compound
+                Investigate Drug Repurposing Hypotheses
               </h2>
               <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                Enter a target disease or drug name to screen repurposing mechanisms.
+                Enter an approved or investigational small-molecule drug to discover candidate indications.
               </p>
             </div>
             <form onSubmit={handleQuickSubmit} className="flex gap-2">
@@ -166,7 +178,7 @@ export const ResearcherDashboard = () => {
                   type="text"
                   value={quickQuery}
                   onChange={(e) => setQuickQuery(e.target.value)}
-                  placeholder="e.g. Type 2 Diabetes, Metformin, Alzheimer's..."
+                  placeholder="e.g. Metformin, Fasudil, Everolimus..."
                   className="w-full pl-10 pr-3.5 py-2.5 text-xs sm:text-sm rounded-xl border border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-950 text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-teal-500"
                 />
               </div>
@@ -186,7 +198,7 @@ export const ResearcherDashboard = () => {
                   <button
                     key={ex}
                     type="button"
-                    onClick={() => navigate('/researcher/drug-repurposing', { state: { prefilledQuery: ex } })}
+                    onClick={() => navigate('/researcher/drug-repurposing', { state: { prefilledQuery: ex, prefilledMode: 'drug-to-disease' } })}
                     className="px-2.5 py-1 text-xs rounded-lg bg-gray-50 dark:bg-gray-800 hover:bg-teal-50 dark:hover:bg-teal-900/30 text-gray-600 dark:text-gray-300 hover:text-teal-700 dark:hover:text-teal-300 border border-gray-200 dark:border-gray-700 transition-colors cursor-pointer"
                   >
                     + {ex}

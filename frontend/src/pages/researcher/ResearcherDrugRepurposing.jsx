@@ -39,17 +39,6 @@ export const ResearcherDrugRepurposing = () => {
   const location = useLocation();
   const navigate = useNavigate();
 
-  const [query, setQuery] = useState(location.state?.prefilledQuery || '');
-  const [minEvidence, setMinEvidence] = useState('all');
-  const [searchMode, setSearchMode] = useState('disease-to-drug'); // 'disease-to-drug' | 'drug-to-disease'
-  const [executing, setExecuting] = useState(false);
-  const [result, setResult] = useState(null);
-  const [error, setError] = useState('');
-  const [selectedCandidate, setSelectedCandidate] = useState(null);
-  const [reportModalOpen, setReportModalOpen] = useState(false);
-  const [viewMode, setViewMode] = useState('table'); // 'table' | 'cards'
-  const [activeTab, setActiveTab] = useState('workspace'); // 'workspace' | 'history'
-
   // Persistent Research History
   const [history, setHistory] = useState(() => {
     try {
@@ -60,17 +49,76 @@ export const ResearcherDrugRepurposing = () => {
     }
   });
 
+  // Persistent Active Investigation state across browser refresh
+  const [result, setResult] = useState(() => {
+    try {
+      const active = sessionStorage.getItem('curenova_active_investigation');
+      if (active) return JSON.parse(active);
+      const stored = localStorage.getItem('curenova_research_history');
+      const hist = stored ? JSON.parse(stored) : [];
+      if (hist.length > 0 && hist[0].result) return hist[0].result;
+    } catch {
+      // ignore
+    }
+    return null;
+  });
+
+  const [query, setQuery] = useState(() => {
+    if (location.state?.prefilledQuery) return location.state.prefilledQuery;
+    try {
+      const active = sessionStorage.getItem('curenova_active_investigation');
+      if (active) {
+        const parsed = JSON.parse(active);
+        return parsed.query_entity || parsed.disease_detected || '';
+      }
+      const stored = localStorage.getItem('curenova_research_history');
+      const hist = stored ? JSON.parse(stored) : [];
+      if (hist.length > 0) return hist[0].query || '';
+    } catch {
+      // ignore
+    }
+    return '';
+  });
+
+  const [minEvidence, setMinEvidence] = useState('all');
+  const [searchMode, setSearchMode] = useState(location.state?.prefilledMode || 'drug-to-disease'); // 'drug-to-disease' | 'disease-to-drug'
+  const [executing, setExecuting] = useState(false);
+  const [error, setError] = useState('');
+  const [selectedCandidate, setSelectedCandidate] = useState(() => {
+    try {
+      const active = sessionStorage.getItem('curenova_active_investigation');
+      if (active) {
+        const parsed = JSON.parse(active);
+        return parsed.candidates?.[0] || null;
+      }
+      const stored = localStorage.getItem('curenova_research_history');
+      const hist = stored ? JSON.parse(stored) : [];
+      if (hist.length > 0 && hist[0].result?.candidates?.length > 0) {
+        return hist[0].result.candidates[0];
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  });
+  const [reportModalOpen, setReportModalOpen] = useState(false);
+  const [viewMode, setViewMode] = useState('table'); // 'table' | 'cards'
+  const [activeTab, setActiveTab] = useState('workspace'); // 'workspace' | 'history'
+
   const exampleQueries = [
-    "Alzheimer's disease",
-    "Parkinson's disease",
-    "Glioblastoma Multiforme",
-    "Diabetic Nephropathy / Type 2 Diabetes"
+    "Metformin",
+    "Fasudil",
+    "Everolimus",
+    "Niclosamide",
+    "Imatinib"
   ];
 
-  const handleRunAnalysis = async (searchQuery = query) => {
+  const handleRunAnalysis = async (searchQuery = query, mode = searchMode) => {
     const cleanQuery = searchQuery.trim();
     if (!cleanQuery) {
-      setError('Please provide a research indication, target, or disease query.');
+      setError(mode === 'drug-to-disease'
+        ? 'Please provide an existing small-molecule drug name (e.g. Metformin, Everolimus).'
+        : 'Please provide a research indication, target, or disease query.');
       return;
     }
     setError('');
@@ -79,9 +127,15 @@ export const ResearcherDrugRepurposing = () => {
 
     try {
       // Direct real API call to backend - NO FAKE TIMERS
-      const response = await repurposingService.analyze(cleanQuery, minEvidence);
+      const backendSearchType = mode === 'drug-to-disease' ? 'drug_to_disease' : 'disease_to_drug';
+      const response = await repurposingService.analyze(cleanQuery, minEvidence, backendSearchType);
       setExecuting(false);
       setResult(response);
+      try {
+        sessionStorage.setItem('curenova_active_investigation', JSON.stringify(response));
+      } catch {
+        // ignore
+      }
 
       if (response.candidates?.length > 0) {
         setSelectedCandidate(response.candidates[0]);
@@ -91,9 +145,10 @@ export const ResearcherDrugRepurposing = () => {
       const historyItem = {
         id: response.analysis_id || `rep-${Date.now()}`,
         query: cleanQuery,
+        search_type: backendSearchType,
         disease_detected: response.disease_detected || cleanQuery,
         candidate_count: response.candidates?.length || 0,
-        top_candidate: response.candidates?.[0]?.drug_name || 'N/A',
+        top_candidate: response.candidates?.[0]?.candidate_name || response.candidates?.[0]?.drug_name || 'N/A',
         timestamp: new Date().toISOString(),
         result: response,
       };
@@ -114,6 +169,11 @@ export const ResearcherDrugRepurposing = () => {
   const handleLoadFromHistory = (item) => {
     setQuery(item.query);
     setResult(item.result);
+    try {
+      sessionStorage.setItem('curenova_active_investigation', JSON.stringify(item.result));
+    } catch {
+      // ignore
+    }
     if (item.result?.candidates?.length > 0) {
       setSelectedCandidate(item.result.candidates[0]);
     }
@@ -124,6 +184,7 @@ export const ResearcherDrugRepurposing = () => {
     setHistory([]);
     try {
       localStorage.removeItem('curenova_research_history');
+      sessionStorage.removeItem('curenova_active_investigation');
     } catch {
       // ignore
     }
@@ -132,6 +193,28 @@ export const ResearcherDrugRepurposing = () => {
   useEffect(() => {
     if (location.state?.prefilledQuery) {
       handleRunAnalysis(location.state.prefilledQuery);
+    } else {
+      const params = new URLSearchParams(window.location.search);
+      const wid = params.get('workflow_id') || params.get('id');
+      if (wid && !result) {
+        repurposingService
+          .getInvestigation(wid)
+          .then((res) => {
+            if (res) {
+              setResult(res);
+              setQuery(res.query_entity || res.disease_detected || '');
+              if (res.candidates?.length > 0) setSelectedCandidate(res.candidates[0]);
+              try {
+                sessionStorage.setItem('curenova_active_investigation', JSON.stringify(res));
+              } catch {
+                // ignore
+              }
+            }
+          })
+          .catch((err) => {
+            console.warn('Failed to load investigation run from URL param:', err);
+          });
+      }
     }
   }, [location.state?.prefilledQuery]);
 
@@ -460,7 +543,9 @@ export const ResearcherDrugRepurposing = () => {
                           <thead className="bg-[var(--color-surface-sunken)] text-[var(--color-text-muted)] border-b border-[var(--color-border-subtle)] uppercase text-[10px] font-mono tracking-wider">
                             <tr>
                               <th className="py-3 px-4">Rank</th>
-                              <th className="py-3 px-4">Candidate Drug</th>
+                              <th className="py-3 px-4">
+                                {searchMode === 'drug-to-disease' ? 'Proposed Indication' : 'Candidate Drug'}
+                              </th>
                               <th className="py-3 px-4">Score</th>
                               <th className="py-3 px-4">Evidence Level</th>
                               <th className="py-3 px-4 text-right">Action</th>
@@ -469,6 +554,11 @@ export const ResearcherDrugRepurposing = () => {
                           <tbody className="divide-y divide-[var(--color-border-subtle)]">
                             {result.candidates?.map((cand, idx) => {
                               const isSelected = selectedCandidate?.id === cand.id;
+                              const displayName = cand.candidate_name || (searchMode === 'drug-to-disease' ? cand.disease_name : cand.drug_name);
+                              const subtitle = searchMode === 'drug-to-disease'
+                                ? `Investigated Drug: ${cand.drug_name || result.query_entity}`
+                                : cand.original_indication;
+
                               return (
                                 <tr
                                   key={cand.id}
@@ -483,12 +573,20 @@ export const ResearcherDrugRepurposing = () => {
                                     #{idx + 1}
                                   </td>
                                   <td className="py-3 px-4">
-                                    <div className="font-bold text-[var(--color-text-primary)]">{cand.drug_name}</div>
-                                    <div className="text-[10px] text-[var(--color-text-muted)] font-mono">{cand.original_indication}</div>
+                                    <div className="font-bold text-[var(--color-text-primary)]">{displayName}</div>
+                                    <div className="text-[10px] text-[var(--color-text-muted)] font-mono">{subtitle}</div>
                                   </td>
                                   <td className="py-3 px-4 font-mono font-bold text-[#0284C7] dark:text-[#38BDF8]">
-                                    {cand.curenova_ranking || 85}
-                                    <span className="text-[10px] text-[var(--color-text-muted)] font-normal"> / 100</span>
+                                    {cand.ml_score_available && cand.curenova_ranking != null ? (
+                                      <>
+                                        {cand.curenova_ranking}
+                                        <span className="text-[10px] text-[var(--color-text-muted)] font-normal"> / 100</span>
+                                      </>
+                                    ) : (
+                                      <span className="text-[10px] font-sans font-semibold text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/40 px-2 py-0.5 rounded border border-amber-200 dark:border-amber-800">
+                                        Evidence Benchmark
+                                      </span>
+                                    )}
                                   </td>
                                   <td className="py-3 px-4">
                                     <RiskBadge severity={cand.evidence_strength} size="sm" />
@@ -512,6 +610,11 @@ export const ResearcherDrugRepurposing = () => {
                     <div className="space-y-4">
                       {result.candidates?.map((cand, idx) => {
                         const isSelected = selectedCandidate?.id === cand.id;
+                        const displayName = cand.candidate_name || (searchMode === 'drug-to-disease' ? cand.disease_name : cand.drug_name);
+                        const subtitle = searchMode === 'drug-to-disease'
+                          ? `Drug: ${cand.drug_name || result.query_entity}`
+                          : cand.original_indication;
+
                         return (
                           <Card
                             key={cand.id}
@@ -529,18 +632,24 @@ export const ResearcherDrugRepurposing = () => {
                                 <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-[#0A2540] text-white">
                                   #{idx + 1}
                                 </span>
-                                <h3 className="text-base font-bold text-[var(--color-text-primary)]">{cand.drug_name}</h3>
-                                <span className="text-xs text-[var(--color-text-muted)] font-mono">({cand.original_indication})</span>
+                                <h3 className="text-base font-bold text-[var(--color-text-primary)]">{displayName}</h3>
+                                <span className="text-xs text-[var(--color-text-muted)] font-mono">({subtitle})</span>
                               </div>
                               <div className="flex items-center gap-2">
-                                <span className="font-mono font-bold text-sm text-[#0284C7] dark:text-[#38BDF8]">
-                                  {cand.curenova_ranking || 85} / 100
-                                </span>
+                                {cand.ml_score_available && cand.curenova_ranking != null ? (
+                                  <span className="font-mono font-bold text-sm text-[#0284C7] dark:text-[#38BDF8]">
+                                    {cand.curenova_ranking} / 100
+                                  </span>
+                                ) : (
+                                  <span className="text-[11px] font-sans font-semibold text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/40 px-2 py-0.5 rounded border border-amber-200 dark:border-amber-800">
+                                    Evidence Benchmark
+                                  </span>
+                                )}
                                 <RiskBadge severity={cand.evidence_strength} size="sm" />
                               </div>
                             </div>
 
-                            <p className="text-xs text-[var(--color-text-secondary)] leading-relaxed">{cand.mechanism}</p>
+                            <p className="text-xs text-[var(--color-text-secondary)] leading-relaxed">{cand.mechanism_summary || cand.mechanism}</p>
 
                             <div className="flex flex-wrap items-center gap-1.5 text-[11px] pt-1">
                               <span className="text-[var(--color-text-muted)] font-semibold mr-1">Biological Targets:</span>
@@ -571,21 +680,23 @@ export const ResearcherDrugRepurposing = () => {
                           <div className="flex items-center justify-between border-b border-[var(--color-border-subtle)] pb-3">
                             <div>
                               <span className="text-[10px] font-mono font-bold text-[var(--color-text-muted)] uppercase tracking-wider block">
-                                Candidate Inspector
+                                {selectedCandidate.candidate_label || (searchMode === 'drug-to-disease' ? 'Proposed Indication' : 'Candidate Drug')}
                               </span>
                               <h3 className="text-lg font-bold text-[var(--color-text-primary)]">
-                                {selectedCandidate.drug_name}
+                                {selectedCandidate.candidate_name || (searchMode === 'drug-to-disease' ? selectedCandidate.disease_name : selectedCandidate.drug_name)}
                               </h3>
                               <span className="text-xs text-[var(--color-text-muted)] font-mono">
-                                Approved Indication: {selectedCandidate.original_indication}
+                                {searchMode === 'drug-to-disease'
+                                  ? `Investigated Drug: ${selectedCandidate.drug_name || result.query_entity}`
+                                  : `Approved Indication: ${selectedCandidate.original_indication}`}
                               </span>
                             </div>
                             <div className="text-right">
                               <span className="text-[10px] font-mono text-[var(--color-text-muted)] block uppercase font-bold">
-                                Congruence
+                                {selectedCandidate.ml_score_available ? 'Congruence' : 'Evidence Prior'}
                               </span>
                               <span className="text-xl font-black font-mono text-[#0284C7] dark:text-[#38BDF8]">
-                                {selectedCandidate.curenova_ranking}
+                                {selectedCandidate.ml_score_available && selectedCandidate.curenova_ranking != null ? selectedCandidate.curenova_ranking : 'Benchmark'}
                               </span>
                             </div>
                           </div>
@@ -596,7 +707,7 @@ export const ResearcherDrugRepurposing = () => {
                               Biological Mechanism
                             </span>
                             <p className="text-xs text-[var(--color-text-secondary)] leading-relaxed">
-                              {selectedCandidate.mechanism}
+                              {selectedCandidate.mechanism_summary || selectedCandidate.mechanism}
                             </p>
                           </div>
 

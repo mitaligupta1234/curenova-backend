@@ -73,34 +73,73 @@ export const AuthProvider = ({ children }) => {
   };
 
   useEffect(() => {
+    const handleSessionExpired = () => {
+      setUser(null);
+      setToken(null);
+    };
+    window.addEventListener('curenova:session-expired', handleSessionExpired);
+    return () => window.removeEventListener('curenova:session-expired', handleSessionExpired);
+  }, []);
+
+  useEffect(() => {
     const savedUser = localStorage.getItem('curenova_user');
     const savedToken = localStorage.getItem('curenova_token');
+    const savedRefresh = localStorage.getItem('curenova_refresh_token');
 
-    if (savedUser && savedToken) {
-      try {
-        const parsed = JSON.parse(savedUser);
-        setUser(normalizeUser(parsed));
-        setToken(savedToken);
-        authService.getMe()
-          .then((liveUser) => {
-            const normalized = normalizeUser(liveUser);
-            localStorage.setItem('curenova_user', JSON.stringify(normalized));
-            setUser(normalized);
-          })
-          .catch((err) => {
-            console.warn('Session verification notice:', err.message);
-          });
-      } catch (e) {
-        localStorage.removeItem('curenova_user');
-        localStorage.removeItem('curenova_token');
-        localStorage.removeItem('curenova_refresh_token');
-        setUser(null);
-        setToken(null);
+    if (savedToken && savedToken.trim()) {
+      if (savedUser) {
+        try {
+          setUser(normalizeUser(JSON.parse(savedUser)));
+        } catch {
+          // ignore parsing error
+        }
       }
+      setToken(savedToken.trim());
+
+      // Authenticate with live backend to ensure token validity
+      authService.getMe()
+        .then((liveUser) => {
+          const normalized = normalizeUser(liveUser);
+          localStorage.setItem('curenova_user', JSON.stringify(normalized));
+          setUser(normalized);
+        })
+        .catch(async (err) => {
+          console.warn('Session verification notice:', err.message);
+          // If access token expired or failed, attempt token refresh if refresh token exists
+          if (savedRefresh) {
+            try {
+              const refreshRes = await authService.refreshToken(savedRefresh);
+              if (refreshRes.access_token) {
+                localStorage.setItem('curenova_token', refreshRes.access_token);
+                if (refreshRes.refresh_token) {
+                  localStorage.setItem('curenova_refresh_token', refreshRes.refresh_token);
+                }
+                setToken(refreshRes.access_token);
+                const liveUser = await authService.getMe();
+                const normalized = normalizeUser(liveUser);
+                localStorage.setItem('curenova_user', JSON.stringify(normalized));
+                setUser(normalized);
+                return;
+              }
+            } catch {
+              // Refresh also failed; session is unrecoverable
+            }
+          }
+          // Clear stale tokens to prevent invalid token loops
+          localStorage.removeItem('curenova_user');
+          localStorage.removeItem('curenova_token');
+          localStorage.removeItem('curenova_refresh_token');
+          setUser(null);
+          setToken(null);
+        })
+        .finally(() => {
+          setLoading(false);
+        });
     } else {
+      localStorage.removeItem('curenova_user');
       setUser(null);
+      setLoading(false);
     }
-    setLoading(false);
   }, []);
 
   const login = async (email, password, role) => {
@@ -144,24 +183,7 @@ export const AuthProvider = ({ children }) => {
 
   const switchRole = async (targetRole) => {
     const target = demoAccounts[targetRole] || demoAccounts.doctor;
-    try {
-      return await login(target.email, target.password, target.role);
-    } catch {
-      const mockUser = {
-        id: `usr-${targetRole}-001`,
-        name: target.name,
-        email: target.email,
-        role: target.role,
-        organization: targetRole === 'doctor' ? 'Mount Sinai Hospital' : targetRole === 'researcher' ? 'Broad Institute of MIT & Harvard' : 'Patient / Caregiver',
-        approval_status: 'approved',
-      };
-      const mockToken = `mock-jwt-token-${targetRole}`;
-      localStorage.setItem('curenova_token', mockToken);
-      localStorage.setItem('curenova_user', JSON.stringify(mockUser));
-      setToken(mockToken);
-      setUser(mockUser);
-      return mockUser;
-    }
+    return await login(target.email, target.password, target.role);
   };
 
   return (

@@ -1,10 +1,13 @@
+import logging
+import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
-import jwt
 from ..database import get_db
 from ..models.models import User
 from ..services.auth_service import decode_jwt_token
+
+logger = logging.getLogger("curenova.auth")
 
 # HTTP Bearer token extractor for Swagger UI and API requests
 http_bearer = HTTPBearer(
@@ -23,22 +26,25 @@ def get_current_user(
     Returns the authenticated User instance.
     """
     if not auth or not auth.credentials:
+        logger.warning("Auth failure: Authorization Bearer header missing or empty")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required",
             headers={"WWW-Authenticate": "Bearer"}
         )
 
-    token = auth.credentials
+    token = auth.credentials.strip()
     try:
         payload = decode_jwt_token(token, expected_type="access")
     except jwt.ExpiredSignatureError:
+        logger.warning("Auth failure: Access token has expired")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token has expired",
             headers={"WWW-Authenticate": "Bearer"}
         )
-    except jwt.PyJWTError:
+    except jwt.PyJWTError as jwt_err:
+        logger.warning("Auth failure: Invalid token signature or claims: %s", str(jwt_err))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication token",

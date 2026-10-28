@@ -32,7 +32,18 @@ export const DoctorResults = () => {
   const location = useLocation();
   const navigate = useNavigate();
   const [reportModalOpen, setReportModalOpen] = useState(false);
-  const [data, setData] = useState(location.state?.analysisData || null);
+  const [data, setData] = useState(() => {
+    if (location.state?.analysisData) return location.state.analysisData;
+    try {
+      const history = JSON.parse(localStorage.getItem('curenova_doctor_safety_history') || '[]');
+      if (history.length > 0 && history[0].analysisData) {
+        return history[0].analysisData;
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  });
 
   if (!data) {
     return (

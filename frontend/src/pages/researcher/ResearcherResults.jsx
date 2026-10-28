@@ -27,7 +27,62 @@ export const ResearcherResults = () => {
   const location = useLocation();
   const navigate = useNavigate();
   const [reportModalOpen, setReportModalOpen] = useState(false);
-  const [data, setData] = useState(location.state?.candidateData || null);
+  const [data, setData] = useState(() => {
+    if (location.state?.candidateData) {
+      try {
+        sessionStorage.setItem('curenova_active_candidate', JSON.stringify(location.state.candidateData));
+      } catch {
+        // ignore
+      }
+      return location.state.candidateData;
+    }
+    try {
+      const activeCand = sessionStorage.getItem('curenova_active_candidate');
+      if (activeCand) return JSON.parse(activeCand);
+
+      const activeInv = sessionStorage.getItem('curenova_active_investigation');
+      if (activeInv) {
+        const parsedInv = JSON.parse(activeInv);
+        if (parsedInv.candidates?.length > 0) {
+          const topCand = parsedInv.candidates[0];
+          return {
+            id: topCand.id,
+            drug_name: topCand.drug_name || topCand.candidate_name,
+            disease: parsedInv.disease_detected || parsedInv.query_entity || 'Target Indication',
+            original_indication: topCand.original_indication || 'Preclinical Repurposing Hypothesis',
+            curenova_ranking: topCand.curenova_ranking ?? Math.round((topCand.prediction_score || 0.85) * 100),
+            evidence_strength: topCand.evidence_strength || 'moderate',
+            status_label: 'Candidate Hypothesis',
+            mechanism_summary: topCand.mechanism_summary || 'Target pathway modulation',
+            evidence_passages: topCand.evidence_passages || [],
+            safety_signals: topCand.safety_signals || [],
+            missing_data: topCand.missing_data || [],
+          };
+        }
+      }
+
+      const history = JSON.parse(localStorage.getItem('curenova_research_history') || '[]');
+      if (history.length > 0 && history[0].result?.candidates?.length > 0) {
+        const topCand = history[0].result.candidates[0];
+        return {
+          id: topCand.id,
+          drug_name: topCand.drug_name,
+          disease: history[0].disease_detected || history[0].query,
+          original_indication: topCand.original_indication || 'Preclinical Repurposing Hypothesis',
+          curenova_ranking: topCand.curenova_ranking ?? Math.round((topCand.prediction_score || 0.85) * 100),
+          evidence_strength: topCand.evidence_strength || 'moderate',
+          status_label: 'Candidate Hypothesis',
+          mechanism_summary: topCand.mechanism_summary || 'Target pathway modulation',
+          evidence_passages: topCand.evidence_passages || [],
+          safety_signals: topCand.safety_signals || [],
+          missing_data: topCand.missing_data || [],
+        };
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  });
 
   if (!data) {
     return (
@@ -79,10 +134,13 @@ export const ResearcherResults = () => {
           </Link>
           <div>
             <h1 className="text-2xl font-extrabold tracking-tight text-[var(--color-text-primary)]">
-              Candidate Repurposing Dossier: {data.drug_name}
+              Repurposing Dossier: {data.candidate_name || data.disease_name || data.drug_name}
             </h1>
             <p className="text-xs text-[var(--color-text-muted)] font-mono">
-              Target Condition: {data.disease} · Evaluated by CureNova Repurposing Engine
+              {data.candidate_label === 'Proposed Indication'
+                ? `Investigated Drug: ${data.drug_name} · Proposed Indication: ${data.disease_name || data.candidate_name}`
+                : `Target Condition: ${data.disease || data.disease_name} · Candidate Drug: ${data.drug_name}`}
+              {' '}· Evaluated by CureNova Repurposing Engine
             </p>
           </div>
         </div>
@@ -116,26 +174,38 @@ export const ResearcherResults = () => {
           <div className="space-y-2">
             <div className="flex flex-wrap items-center gap-2">
               <Badge variant="info" size="md">
-                {data.status_label}
+                {data.status_label || (data.candidate_label === 'Proposed Indication' ? 'Repurposing Candidate' : 'FDA Approved')}
               </Badge>
               <RiskBadge severity={data.evidence_strength} size="sm" />
             </div>
             <h2 className="text-xl font-bold text-[var(--color-text-primary)]">
-              {data.drug_name} in {data.disease}
+              {data.candidate_label === 'Proposed Indication'
+                ? `${data.drug_name} for ${data.disease_name || data.candidate_name || data.disease}`
+                : `${data.drug_name} in ${data.disease}`}
             </h2>
             <div className="text-xs text-[var(--color-text-secondary)] flex flex-wrap gap-2">
-              <span className="text-[var(--color-text-muted)]">Approved Indication:</span>
+              <span className="text-[var(--color-text-muted)]">
+                {data.candidate_label === 'Proposed Indication' ? 'Clinical Status / Prior:' : 'Approved Indication:'}
+              </span>
               <span className="font-semibold text-[var(--color-text-primary)]">{data.original_indication}</span>
             </div>
           </div>
 
           <div className="sm:text-right shrink-0">
             <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-[var(--color-text-muted)] block">
-              CureNova Congruence Ranking
+              {data.ml_score_available !== false ? 'CureNova Congruence Ranking' : 'Biomedical Evidence Benchmark'}
             </span>
             <div className="text-3xl font-extrabold tabular text-[#0284C7]">
-              {data.curenova_ranking}
-              <span className="text-sm font-normal text-[var(--color-text-muted)]"> / 100</span>
+              {data.ml_score_available !== false && data.curenova_ranking != null ? (
+                <>
+                  {data.curenova_ranking}
+                  <span className="text-sm font-normal text-[var(--color-text-muted)]"> / 100</span>
+                </>
+              ) : (
+                <span className="text-sm font-semibold text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/40 px-2 py-1 rounded border border-amber-200 dark:border-amber-800">
+                  Evidence Benchmark
+                </span>
+              )}
             </div>
           </div>
         </div>

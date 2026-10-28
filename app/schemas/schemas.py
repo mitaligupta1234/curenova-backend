@@ -103,6 +103,12 @@ class CandidateSummaryOut(BaseModel):
     score_type: Optional[str] = "ranking_score"
     stress_score: Optional[float] = None
     stress_interpretation: Optional[str] = None
+    candidate_name: Optional[str] = None
+    candidate_type: Optional[str] = None
+    candidate_label: Optional[str] = None
+    ml_score_available: Optional[bool] = True
+    biological_mechanism: Optional[str] = None
+    provenance: Optional[str] = "precomputed_feature_store"
     model_config = ConfigDict(from_attributes=True)
 
 class CandidateDetailOut(CandidateSummaryOut):
@@ -172,6 +178,41 @@ class DDIAlert(BaseModel):
     recommendation: str
     verified_source: str
     source_url: Optional[str] = None
+
+class RegimenAnalysisRequest(BaseModel):
+    medications: List[str] = Field(..., min_length=1, description="List of medication names to evaluate")
+    patient_context: Optional[Dict[str, Any]] = None
+
+class PairwiseInteractionOut(BaseModel):
+    drug_a: str
+    drug_b: str
+    matched_monograph_a: Optional[str] = None
+    matched_monograph_b: Optional[str] = None
+    severity: str
+    mechanism: str
+    clinical_recommendation: str
+    verified_source: str
+    source_url: Optional[str] = None
+    is_documented_interaction: bool = True
+
+class RegimenAnalysisOut(BaseModel):
+    analysis_id: str
+    overall_risk_category: str
+    overall_risk_score: float
+    summary_headline: str
+    total_medications: int
+    evaluated_medications: List[str]
+    total_pairs_evaluated: int
+    pairwise_interactions: List[PairwiseInteractionOut] = []
+    unmonitored_pairs: List[Dict[str, Any]] = []
+    contraindications_count: int = 0
+    major_interactions_count: int = 0
+    moderate_interactions_count: int = 0
+    minor_interactions_count: int = 0
+    patient_context: Optional[Dict[str, Any]] = None
+    safety_disclaimer: str
+    created_at: str
+
 
 class ClinicalTrialOut(BaseModel):
     id: int
@@ -254,14 +295,25 @@ class AgentWorkflowResponse(BaseModel):
     workflow_id: str
     query_entity: str
     entity_type: str
+    search_type: Optional[str] = "drug_to_disease"
+    query_type: Optional[str] = "drug"
+    queried_entity: Optional[Dict[str, Any]] = None
     completed_steps: List[AgentWorkflowStep]
     candidate_hypotheses: List[CandidateSummaryOut]
+    candidates: List[CandidateSummaryOut] = []
     synthesis_report: str
     limitations_and_boundary_warning: str
     provenance_mode: Literal["llm", "deterministic_fallback"] = "deterministic_fallback"
     llm_provider: Optional[str] = "none"
     model_version: Optional[str] = "2.5.0"
     structured_synthesis: Optional[StructuredSynthesisOut] = None
+    mechanisms: List[Dict[str, Any]] = []
+    safety_findings: List[Dict[str, Any]] = []
+    contradictions: List[str] = []
+    ml_prediction_metadata: Dict[str, Any] = {}
+    transcriptomic_connectivity: Optional[Dict[str, Any]] = None
+    clinical_trial_challenge: Optional[Dict[str, Any]] = None
+
 
 # Research Feedback & Offline Evaluation
 class FeedbackCreate(BaseModel):

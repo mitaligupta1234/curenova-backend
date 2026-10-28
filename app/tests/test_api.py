@@ -16,6 +16,14 @@ from app.services.seed_data import seed_database
 from app.main import app
 from app.config import Settings, settings
 from scripts.bootstrap_admin import bootstrap_admin, rotate_admin_password
+from app.models.models import InvestigationRun
+from ml.predict_v4 import (
+    query_candidates,
+    query_candidates_for_drug,
+    predict,
+    predict_for_drug
+)
+from ml.predictor import predict_candidates, predict_candidates_for_drug
 
 
 
@@ -1833,3 +1841,1361 @@ def test_layman_plain_language_explanation_and_dossier_reports():
     assert r_rep.status_code == 200
     assert "CURENOVA 2.0" in r_rep.text
     assert "BIOLOGICAL MECHANISM OF ACTION" in r_rep.text
+
+
+# ---------------------------------------------------------------------------
+# Verified Functionality Repairs Scenarios
+# ---------------------------------------------------------------------------
+def test_ml_service_is_available_and_loads_model():
+    """Confirms production ML service is available and accurately reports model version."""
+    from app.services.ml_service import MLService
+    assert MLService.is_available() is True
+    info = MLService.get_info()
+    assert info["model_version"] == "cure-nova-xgb-final"
+    assert info["model_type"] == "XGBoost"
+    assert info["feature_count"] == 39
+
+def test_ml_real_xgboost_inference_top_candidates():
+    """Confirms XGBoost production model generates real uncalibrated ranking scores."""
+    from ml.predictor import predict_and_enrich
+    res = predict_and_enrich("MONDO_0004989", top_k=3)
+    assert res["candidate_count"] >= 3
+    top = res["candidates"][0]
+    assert "drug_id" in top
+    assert "score" in top
+    assert float(top["score"]) > 0.5
+    assert "chembl_evidence" in top
+    assert "stress_test" in top
+
+def test_challenge_agent_adversarial_audit():
+    """Confirms ChallengeAgent generates adversarial challenges and verification requirements."""
+    import asyncio
+    from app.services.biomedical_agents import ChallengeAgent
+    evidence_facts = [
+        {"id": 101, "title": "Experimental in vitro study", "evidence_direction": "contradictory", "excerpt": "Negative efficacy"}
+    ]
+    report = asyncio.run(ChallengeAgent.run(
+        drug_name="Azacitidine",
+        disease_name="Breast Carcinoma",
+        top_candidate=None,
+        evidence_facts=evidence_facts,
+        llm_client=None
+    ))
+    assert report["adversarial_audit_status"] == "COMPLETED"
+    assert len(report["challenges"]) >= 1
+    assert any("Contradictory" in c for c in report["challenges"])
+    assert len(report["validation_requirements"]) >= 1
+
+def test_investigation_run_persistence_and_retrieval():
+    """Confirms investigations persist in SQLite and are retrievable by ID."""
+    headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+
+    # Run investigation
+    res = client.post("/api/candidates/investigate?query=Breast%20Carcinoma", headers=headers)
+    assert res.status_code == 200
+    data = res.json()
+    wf_id = data["workflow_id"]
+    assert wf_id.startswith("WF-CURENOVA-")
+
+    # Retrieve by ID
+    get_res = client.get(f"/api/candidates/investigation/{wf_id}", headers=headers)
+    assert get_res.status_code == 200
+    retrieved = get_res.json()
+    assert retrieved["workflow_id"] == wf_id
+    assert len(retrieved["completed_steps"]) == 6
+
+    # List past investigations
+    list_res = client.get("/api/candidates/investigations", headers=headers)
+    assert list_res.status_code == 200
+    items = list_res.json()
+    assert any(i["workflow_id"] == wf_id for i in items)
+
+def test_patient_regimen_persistence_crud():
+    """Confirms patient medication regimen can be created, retrieved, toggled, and removed."""
+    headers = get_auth_headers("sarah.jenkins@patient-portal.org")
+
+    # Add medication
+    add_res = client.post("/api/patient/regimen", json={
+        "drug_name": "Metformin",
+        "dosage": "500mg twice daily",
+        "time_of_day": "Morning (8:00 AM)"
+    }, headers=headers)
+    assert add_res.status_code == 200
+    med_id = add_res.json()["id"]
+
+    # Retrieve regimen
+    get_res = client.get("/api/patient/regimen", headers=headers)
+    assert get_res.status_code == 200
+    regimen = get_res.json()
+    assert any(m["id"] == med_id for m in regimen)
+
+    # Toggle dose
+    toggle_res = client.post(f"/api/patient/regimen/{med_id}/toggle", headers=headers)
+    assert toggle_res.status_code == 200
+    assert toggle_res.json()["taken"] is True
+
+    # Remove medication
+    del_res = client.delete(f"/api/patient/regimen/{med_id}", headers=headers)
+    assert del_res.status_code == 200
+
+def test_evidence_explorer_filter_parameters():
+    """Confirms /api/evidence supports q and source parameters returning a direct list."""
+    res = client.get("/api/evidence?q=Metformin")
+    assert res.status_code == 200
+    assert isinstance(res.json(), list)
+
+def test_doctor_adverse_events_endpoint():
+    """Confirms /api/doctor/adverse-events requires doctor authorization and returns structured events."""
+    doc_headers = get_auth_headers("marcus.chen.md@metropolitan-health.org")
+    res = client.get("/api/doctor/adverse-events?drug=Aspirin&limit=3", headers=doc_headers)
+    assert res.status_code == 200
+    data = res.json()
+    assert "drug" in data
+    assert "disclaimer" in data
+
+
+# ---------------------------------------------------------------------------
+# PHASE 4: Candidate Ranking & Query Dependency Tests (A through G)
+# ---------------------------------------------------------------------------
+
+def test_phase4_a_submit_query_a_and_record_pipeline():
+    """
+    Test A: Submit Query A ('Pulmonary Arterial Hypertension')
+    Record exact request, candidate-generation inputs, feature inputs, model outputs, and response.
+    """
+    headers = get_auth_headers()
+    query_a = "Pulmonary Arterial Hypertension"
+
+    # 1. Direct ML Pipeline Check
+    disease_features = query_candidates("MONDO_0005149")
+    assert len(disease_features) > 0, "Feature dataset must contain rows for MONDO_0005149"
+    direct_res = predict_candidates("MONDO_0005149", top_k=10)
+    direct_preds = direct_res.get("candidates", [])
+    assert len(direct_preds) > 0
+
+    # 2. End-to-end API Investigation
+    res = client.post("/api/candidates/investigate", params={"query": query_a}, headers=headers)
+    assert res.status_code == 200, f"Investigate failed: {res.text}"
+    data = res.json()
+
+    assert data["query_entity"] == "Pulmonary Arterial Hypertension"
+    assert data["entity_type"] in ("Disease", "Disease (Ontology Matched)")
+    assert len(data["candidate_hypotheses"]) > 0
+
+    top_cand = data["candidate_hypotheses"][0]
+    # Direct model outputs for PAH should match top candidate from predict_candidates
+    assert top_cand["chembl_id"] == direct_preds[0]["drug_id"]
+    assert abs(top_cand["prediction_score"] - direct_preds[0]["score"]) < 1e-4
+
+    # Verify step logging reflects real ML model execution
+    step4 = next(s for s in data["completed_steps"] if s["step_id"] == 4)
+    assert "CureNova XGBoost Production Model" in step4["provenance"]
+    assert "tool_compute_curenova_xgboost_inference" in step4["tool_called"]
+
+
+def test_phase4_b_genuinely_different_query_b_processed_distinctly():
+    """
+    Test B: Submit genuinely different Query B ('Everolimus')
+    Verify backend processes actual input rather than silently substituting Query A or a default.
+    """
+    headers = get_auth_headers()
+
+    # Query A: Disease
+    res_a = client.post("/api/candidates/investigate", params={"query": "Pulmonary Arterial Hypertension"}, headers=headers)
+    assert res_a.status_code == 200
+    data_a = res_a.json()
+
+    # Query B: Drug
+    res_b = client.post("/api/candidates/investigate", params={"query": "Everolimus"}, headers=headers)
+    assert res_b.status_code == 200, f"Investigate failed for Query B: {res_b.text}"
+    data_b = res_b.json()
+
+    # Verify Query B was resolved as Drug, NOT Pulmonary Arterial Hypertension
+    assert data_b["query_entity"].upper() == "EVEROLIMUS"
+    assert data_b["entity_type"] == "Drug"
+    assert data_b["query_entity"] != data_a["query_entity"]
+
+    # Verify candidate hypotheses are different:
+    # Query A's candidates are drugs (Temsirolimus, Everolimus, Candesartan...)
+    # Query B's candidates are disease indications evaluated for Everolimus!
+    assert len(data_b["candidate_hypotheses"]) > 0
+    candidate_names_a = [c["drug_name"] for c in data_a["candidate_hypotheses"]]
+    candidate_diseases_b = [c["disease_name"] for c in data_b["candidate_hypotheses"]]
+
+    # They should evaluate different entities
+    assert candidate_names_a != candidate_diseases_b
+
+
+def test_phase4_c_candidate_features_correspond_to_correct_identifiers():
+    """
+    Test C: Verify candidate features correspond to the correct drug and disease identifiers.
+    """
+    # 1. Test for disease lookup features
+    disease_rows = query_candidates("MONDO_0005149")
+    for row in disease_rows:
+        assert row["disease_id"] == "MONDO_0005149"
+        assert row["drug_id"].startswith("CHEMBL")
+        # Ensure biomedical and molecular features exist
+        assert "shared_targets" in row
+        assert "molecular_weight" in row
+
+    # 2. Test for drug lookup features
+    drug_rows = query_candidates_for_drug("CHEMBL1908360")  # Everolimus
+    for row in drug_rows:
+        assert row["drug_id"] == "CHEMBL1908360"
+        assert row["disease_id"].startswith("MONDO_")
+
+
+def test_phase4_d_model_failures_cannot_silently_become_fake_predictions():
+    """
+    Test D: Verify that entities with missing features or unresolvable entities
+    cannot silently become successful-looking predictions with default PAH candidates.
+    """
+    headers = get_auth_headers()
+    unsupported_query = "CompletelyUnknownEntity999"
+
+    res = client.post("/api/candidates/investigate", params={"query": unsupported_query}, headers=headers)
+    assert res.status_code == 200
+    data = res.json()
+
+    # Must be identified as Unresolved Entity
+    assert data["entity_type"] == "Unresolved Entity"
+    assert data["query_entity"] == unsupported_query
+
+    # MUST NOT return the default PAH candidates or dump DB
+    assert data["candidate_hypotheses"] == []
+    # Must explicitly state data limitation
+    assert "DATA LIMITATION" in data["limitations_and_boundary_warning"]
+    assert "No synthetic or mock predictions were generated" in data["limitations_and_boundary_warning"]
+
+
+def test_phase4_e_cached_results_isolation_and_distinct_workflow_ids():
+    """
+    Test E: Verify cached results cannot be returned incorrectly for a different query,
+    and each investigation run generates a unique workflow ID and persists its own record.
+    """
+    headers = get_auth_headers()
+    db = TestingSessionLocal()
+
+    res1 = client.post("/api/candidates/investigate", params={"query": "Pulmonary Arterial Hypertension"}, headers=headers)
+    res2 = client.post("/api/candidates/investigate", params={"query": "Everolimus"}, headers=headers)
+
+    assert res1.status_code == 200
+    assert res2.status_code == 200
+    d1 = res1.json()
+    d2 = res2.json()
+
+    # Workflow IDs must be unique
+    assert d1["workflow_id"] != d2["workflow_id"]
+
+    # Verify both runs are saved with distinct queries in investigation_runs table
+    runs = db.query(InvestigationRun).all()
+    query_set = {r.query for r in runs}
+    assert "Pulmonary Arterial Hypertension" in query_set
+    assert "Everolimus" in query_set
+    db.close()
+
+
+def test_phase4_f_ranking_and_scores_from_real_configured_pipeline():
+    """
+    Test F: Verify that returned ranking and scores are generated by the actual configured pipeline.
+    """
+    headers = get_auth_headers()
+    res = client.post("/api/candidates/investigate", params={"query": "Pulmonary Arterial Hypertension"}, headers=headers)
+    assert res.status_code == 200
+    candidates = res.json()["candidate_hypotheses"]
+
+    # Check that candidates are sorted in descending order of score
+    scores = [c["prediction_score"] for c in candidates]
+    assert scores == sorted(scores, reverse=True)
+
+    # Compare with direct predict_candidates output
+    direct_res = predict_candidates("MONDO_0005149", top_k=len(candidates))
+    direct_preds = direct_res.get("candidates", [])
+    for api_cand, direct_cand in zip(candidates, direct_preds):
+        assert api_cand["chembl_id"] == direct_cand["drug_id"]
+        assert abs(api_cand["prediction_score"] - direct_cand["score"]) < 1e-4
+
+
+def test_phase4_g_authentication_and_role_restrictions():
+    """
+    Test G: Verify authentication and role restrictions still work.
+    """
+    # 1. Unauthenticated request should be rejected (401)
+    res_no_auth = client.post("/api/candidates/investigate", params={"query": "Pulmonary Arterial Hypertension"})
+    assert res_no_auth.status_code == 401
+
+    # 2. Non-researcher role (e.g. doctor) request should be forbidden (403)
+    doctor_headers = get_auth_headers(
+        email="marcus.chen.md@metropolitan-health.org",
+        password="CureNova2026!Secure"
+    )
+    res_doctor = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Pulmonary Arterial Hypertension"},
+        headers=doctor_headers
+    )
+    assert res_doctor.status_code == 403
+    assert "Forbidden" in res_doctor.text
+
+    # 3. Researcher role request is allowed (200)
+    researcher_headers = get_auth_headers(
+        email="dr.elena.vance@curenova-research.org",
+        password="CureNova2026!Secure"
+    )
+    res_researcher = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Pulmonary Arterial Hypertension"},
+        headers=researcher_headers
+    )
+    assert res_researcher.status_code == 200
+
+
+# ===========================================================================
+# PHASE 1 — DRUG-FIRST RESEARCHER WORKFLOW ALIGNMENT TESTS
+# ===========================================================================
+
+def test_phase1_1_drug_first_investigation_everolimus():
+    """
+    Test 1: Drug-first investigation using Everolimus.
+    Verifies that Everolimus generates ranked candidate disease indications with real ML scores.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Everolimus", "search_type": "drug_to_disease"},
+        headers=researcher_headers
+    )
+    assert res.status_code == 200, f"Failed: {res.text}"
+    data = res.json()
+
+    assert data["search_type"] == "drug_to_disease"
+    assert data["query_type"] == "drug"
+    assert data["queried_entity"]["name"] == "EVEROLIMUS"
+    assert data["queried_entity"]["identifier"] == "CHEMBL1908360"
+
+    candidates = data["candidates"]
+    assert len(candidates) > 0, "Everolimus should have ranked disease candidates"
+    for cand in candidates:
+        assert cand["candidate_label"] == "Proposed Indication"
+        assert cand["candidate_type"] == "disease"
+        assert cand["drug_name"] == "EVEROLIMUS"
+        assert cand["candidate_name"] == cand["disease_name"]
+        assert cand["prediction_score"] > 0.0
+        assert cand["ml_score_available"] is True
+
+    assert data["ml_prediction_metadata"]["status"] == "available"
+
+
+def test_phase1_2_drug_first_investigation_metformin():
+    """
+    Test 2: Drug-first investigation using Metformin.
+    Verifies that Metformin returns proposed indications with verified biological labels.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Metformin", "search_type": "drug_to_disease"},
+        headers=researcher_headers
+    )
+    assert res.status_code == 200, f"Failed: {res.text}"
+    data = res.json()
+
+    assert data["search_type"] == "drug_to_disease"
+    assert data["query_type"] == "drug"
+    assert "METFORMIN" in data["queried_entity"]["name"].upper()
+    assert data["ml_prediction_metadata"]["status"] in ("available", "unavailable")
+
+    # Candidates should be labeled as proposed indications
+    candidates = data["candidates"]
+    if candidates:
+        for cand in candidates:
+            assert cand["candidate_label"] == "Proposed Indication"
+
+
+def test_phase1_3_disease_first_backward_compatibility():
+    """
+    Test 3: Disease-first backward compatibility.
+    Verifies that disease_to_drug workflow preserves returning candidate drugs for a disease.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Pulmonary Arterial Hypertension", "search_type": "disease_to_drug"},
+        headers=researcher_headers
+    )
+    assert res.status_code == 200, f"Failed: {res.text}"
+    data = res.json()
+
+    assert data["search_type"] == "disease_to_drug"
+    assert data["query_type"] == "disease"
+    assert "PULMONARY ARTERIAL HYPERTENSION" in data["queried_entity"]["name"].upper()
+
+    candidates = data["candidates"]
+    assert len(candidates) > 0
+    for cand in candidates:
+        assert cand["candidate_label"] == "Candidate Drug"
+        assert cand["candidate_type"] == "drug"
+        assert cand["candidate_name"] == cand["drug_name"]
+
+
+def test_phase1_4_explicit_search_type_propagation():
+    """
+    Test 4: Explicit search_type propagation.
+    Verifies that search_type query parameter is accepted and accurately returned in payload.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+
+    # 1. Explicit drug_to_disease
+    r1 = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Everolimus", "search_type": "drug_to_disease"},
+        headers=researcher_headers
+    )
+    assert r1.status_code == 200
+    assert r1.json()["search_type"] == "drug_to_disease"
+
+    # 2. Explicit disease_to_drug
+    r2 = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Colorectal Cancer", "search_type": "disease_to_drug"},
+        headers=researcher_headers
+    )
+    assert r2.status_code == 200
+    assert r2.json()["search_type"] == "disease_to_drug"
+
+
+def test_phase1_5_invalid_search_type_validation():
+    """
+    Test 5: Invalid search_type validation.
+    Verifies that unsupported search_type values return HTTP 422 Unprocessable Entity.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+
+    r_invalid1 = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Everolimus", "search_type": "invalid_direction"},
+        headers=researcher_headers
+    )
+    assert r_invalid1.status_code == 422
+    assert "Invalid search_type" in r_invalid1.text
+
+    r_invalid2 = client.get(
+        "/api/candidates/investigate",
+        params={"query": "Everolimus", "search_type": "unknown_type"},
+        headers=researcher_headers
+    )
+    assert r_invalid2.status_code == 422
+
+
+def test_phase1_6_correct_response_entity_types_and_labels():
+    """
+    Test 6: Correct response entity types and labels.
+    Verifies that queried_entity, candidate_label, candidate_type, and candidate_name are properly set.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Everolimus", "search_type": "drug_to_disease"},
+        headers=researcher_headers
+    )
+    assert res.status_code == 200
+    data = res.json()
+
+    assert data["queried_entity"]["type"] == "Drug"
+    assert data["queried_entity"]["query_type"] == "drug"
+    assert data["queried_entity"]["identifier_type"] == "ChEMBL ID"
+
+    for cand in data["candidates"]:
+        assert cand["candidate_label"] == "Proposed Indication"
+        assert cand["candidate_type"] == "disease"
+        assert cand["candidate_name"] == cand["disease_name"]
+
+
+def test_phase1_7_unindexed_drug_behavior_no_ml_candidates():
+    """
+    Test 7: Unindexed drug behavior when ML candidates are unavailable.
+    Verifies that unindexed drugs complete safely with 0 ML candidates and clear boundary disclaimers.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Tilorone", "search_type": "drug_to_disease"},
+        headers=researcher_headers
+    )
+    assert res.status_code == 200
+    data = res.json()
+
+    assert data["query_type"] == "drug"
+    assert data["ml_prediction_metadata"]["status"] == "unavailable"
+    assert "[ML BOUNDARY NOTICE]" in data["limitations_and_boundary_warning"]
+    assert len(data["candidates"]) == 0
+
+
+def test_phase1_8_researcher_authorization_enforced():
+    """
+    Test 8: Researcher authorization enforcement on /api/candidates/investigate.
+    """
+    # 1. Unauthenticated is rejected with 401
+    r_no_auth = client.post("/api/candidates/investigate", params={"query": "Everolimus"})
+    assert r_no_auth.status_code == 401
+
+    # 2. Patient account is rejected with 403
+    patient_headers = get_auth_headers("sarah.jenkins@patient-portal.org")
+    r_patient = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Everolimus"},
+        headers=patient_headers
+    )
+    assert r_patient.status_code == 403
+
+    # 3. Approved researcher is permitted with 200
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    r_researcher = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Everolimus"},
+        headers=researcher_headers
+    )
+    assert r_researcher.status_code == 200
+
+
+def test_phase1_9_investigation_persistence_and_retrieval():
+    """
+    Test 9: Investigation persistence.
+    Verifies that investigation run is persisted and retrievable by workflow_id.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Everolimus", "search_type": "drug_to_disease"},
+        headers=researcher_headers
+    )
+    assert res.status_code == 200
+    workflow_id = res.json()["workflow_id"]
+    assert workflow_id.startswith("WF-CURENOVA-")
+
+    # Retrieve by ID
+    get_res = client.get(f"/api/candidates/investigation/{workflow_id}", headers=researcher_headers)
+    assert get_res.status_code == 200
+    persisted_data = get_res.json()
+    assert persisted_data["workflow_id"] == workflow_id
+    assert persisted_data["search_type"] == "drug_to_disease"
+
+    # List past investigations
+    list_res = client.get("/api/candidates/investigations", headers=researcher_headers)
+    assert list_res.status_code == 200
+    runs = list_res.json()
+    assert any(r["workflow_id"] == workflow_id for r in runs)
+
+
+def test_phase1_10_biomedical_fallback_resilience():
+    """
+    Test 10: Error handling and biomedical fallback resilience.
+    Verifies deterministic fallback workflow completes all steps when external services are unavailable.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Niclosamide", "search_type": "drug_to_disease"},
+        headers=researcher_headers
+    )
+    assert res.status_code == 200
+    data = res.json()
+
+    assert len(data["completed_steps"]) == 6
+    for step in data["completed_steps"]:
+        assert step["status"] == "completed"
+    assert data["provenance_mode"] in ("llm", "deterministic_fallback")
+
+
+# ==============================================================================
+# PHASE 2: DYNAMIC ML FEATURE GENERATION & PREDICTION TESTS
+# ==============================================================================
+
+def test_phase2_1_dynamic_feature_generation_fasudil():
+    """
+    Test Phase 2.1: Dynamic feature generation for Fasudil.
+    Fasudil is not in precomputed parquet, but has molecular descriptors and ROCK1/2 targets.
+    Generates genuine 39-feature vectors and scores via XGBoost with dynamic provenance.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Fasudil", "search_type": "drug_to_disease"},
+        headers=researcher_headers
+    )
+    assert res.status_code == 200, f"Failed: {res.text}"
+    data = res.json()
+
+    assert data["query_type"] == "drug"
+    assert "FASUDIL" in data["queried_entity"]["name"].upper()
+    assert data["ml_prediction_metadata"]["status"] == "available"
+    assert "Dynamic Feature Generation" in data["ml_prediction_metadata"]["inference_engine"]
+
+    candidates = data["candidates"]
+    assert len(candidates) > 0
+    for cand in candidates:
+        assert cand["candidate_label"] == "Proposed Indication"
+        assert cand["candidate_type"] == "disease"
+        assert cand["ml_score_available"] is True
+        assert cand["provenance"] == "dynamic_feature_generation"
+        assert cand["prediction_score"] > 0.50
+
+
+def test_phase2_2_dynamic_feature_generation_metformin():
+    """
+    Test Phase 2.2: Dynamic feature generation for Metformin.
+    Metformin generates 39-feature vectors dynamically and receives genuine XGBoost scores.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Metformin", "search_type": "drug_to_disease"},
+        headers=researcher_headers
+    )
+    assert res.status_code == 200, f"Failed: {res.text}"
+    data = res.json()
+
+    assert data["query_type"] == "drug"
+    assert "METFORMIN" in data["queried_entity"]["name"].upper()
+    assert data["ml_prediction_metadata"]["status"] == "available"
+
+    candidates = data["candidates"]
+    assert len(candidates) > 0
+    for cand in candidates:
+        assert cand["candidate_label"] == "Proposed Indication"
+        assert cand["ml_score_available"] is True
+        assert cand["prediction_score"] > 0.0
+
+
+def test_phase2_3_everolimus_precomputed_baseline_preserved():
+    """
+    Test Phase 2.3: Baseline preservation for Everolimus.
+    Everolimus continues to be served via precomputed feature store without regressions.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Everolimus", "search_type": "drug_to_disease"},
+        headers=researcher_headers
+    )
+    assert res.status_code == 200
+    data = res.json()
+
+    assert data["ml_prediction_metadata"]["status"] == "available"
+    candidates = data["candidates"]
+    assert len(candidates) >= 5
+    assert candidates[0]["prediction_score"] >= 0.70
+    assert candidates[0]["provenance"] == "precomputed_feature_store"
+
+
+def test_phase2_4_niclosamide_uncharacterized_targets_boundary():
+    """
+    Test Phase 2.4: Scientific boundary enforcement for Niclosamide.
+    Niclosamide lacks characterized human targets in Open Targets.
+    System honestly marks ML unavailable rather than fabricating biological target associations.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Niclosamide", "search_type": "drug_to_disease"},
+        headers=researcher_headers
+    )
+    assert res.status_code == 200
+    data = res.json()
+
+    assert data["query_type"] == "drug"
+    assert data["ml_prediction_metadata"]["status"] == "unavailable"
+    assert "DATA LIMITATION" in data["limitations_and_boundary_warning"]
+    for c in data["candidates"]:
+        assert c["ml_score_available"] is False
+        assert c["score_type"] == "curated_evidence_benchmark"
+
+
+def test_phase2_5_incomplete_vector_or_missing_identifier_rejected():
+    """
+    Test Phase 2.5: Incomplete vector and invalid identifier validation.
+    """
+    from ml.feature_generator import generate_dynamic_features_for_drug
+
+    # 1. Non-ChEMBL ID
+    cands, err = generate_dynamic_features_for_drug("INVALID_ID")
+    assert cands == []
+    assert "not a valid ChEMBL identifier" in err
+
+    # 2. Unknown compound with no molecular descriptors
+    cands_unk, err_unk = generate_dynamic_features_for_drug("CHEMBL999999999")
+    assert cands_unk == []
+    assert "No molecular descriptor features available" in err_unk
+
+
+def test_phase2_6_feature_contract_and_ordering_39_features():
+    """
+    Test Phase 2.6: Exact 39-feature contract, types, and ordering.
+    """
+    import joblib
+    import numpy as np
+    from ml.feature_generator import generate_dynamic_features_for_drug, MODEL_FEATURES
+
+    bundle = joblib.load("ml/models/cure_nova_xgb_final.joblib")
+    expected_features = bundle["features"]
+    assert len(expected_features) == 39
+
+    rows, err = generate_dynamic_features_for_drug("CHEMBL38380")
+    assert err is None
+    assert len(rows) > 0
+
+    first_row = rows[0]
+    # Verify every required feature is present
+    for feat in expected_features:
+        assert feat in first_row, f"Missing required feature: {feat}"
+        val = first_row[feat]
+        assert isinstance(val, (int, float)), f"Feature {feat} is not numerical: {type(val)}"
+        assert not np.isnan(val), f"Feature {feat} is NaN"
+        assert not np.isinf(val), f"Feature {feat} is infinite"
+
+    # Verify model matrix shape
+    X = np.array([[r[f] for f in expected_features] for r in rows], dtype=np.float32)
+    assert X.shape == (len(rows), 39)
+
+
+def test_phase2_7_distinct_query_isolation_and_no_reused_vectors():
+    """
+    Test Phase 2.7: Query isolation.
+    Fasudil, Metformin, and Everolimus produce genuinely different candidates and rankings.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    r_fasudil = client.post("/api/candidates/investigate", params={"query": "Fasudil"}, headers=researcher_headers).json()
+    r_metformin = client.post("/api/candidates/investigate", params={"query": "Metformin"}, headers=researcher_headers).json()
+    r_everolimus = client.post("/api/candidates/investigate", params={"query": "Everolimus"}, headers=researcher_headers).json()
+
+    c_fas = [c["candidate_name"] for c in r_fasudil["candidates"]]
+    c_met = [c["candidate_name"] for c in r_metformin["candidates"]]
+    c_eve = [c["candidate_name"] for c in r_everolimus["candidates"]]
+
+    assert r_fasudil["workflow_id"] != r_metformin["workflow_id"] != r_everolimus["workflow_id"]
+    assert c_fas != c_met or r_fasudil["candidates"][0]["prediction_score"] != r_metformin["candidates"][0]["prediction_score"]
+
+
+def test_phase2_8_disease_to_drug_regression_preserved():
+    """
+    Test Phase 2.8: Preservation of disease-to-drug direction.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Pulmonary Arterial Hypertension", "search_type": "disease_to_drug"},
+        headers=researcher_headers
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["search_type"] == "disease_to_drug"
+    assert data["query_type"] == "disease"
+    assert len(data["candidates"]) > 0
+    assert data["candidates"][0]["candidate_label"] == "Candidate Drug"
+
+
+def test_phase2_9_investigation_persistence_with_dynamic_provenance():
+    """
+    Test Phase 2.9: Investigation persistence with dynamic ML provenance.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Fasudil", "search_type": "drug_to_disease"},
+        headers=researcher_headers
+    )
+    assert res.status_code == 200
+    wf_id = res.json()["workflow_id"]
+
+    get_res = client.get(f"/api/candidates/investigation/{wf_id}", headers=researcher_headers)
+    assert get_res.status_code == 200
+    persisted = get_res.json()
+    assert persisted["workflow_id"] == wf_id
+    assert persisted["search_type"] == "drug_to_disease"
+    assert persisted["candidates"][0]["provenance"] == "dynamic_feature_generation"
+
+
+def test_phase2_10_external_graphql_timeout_resilience():
+    """
+    Test Phase 2.10: Resilience when external network calls fail or time out.
+    """
+    from unittest.mock import patch
+    import urllib.error
+
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("Network unreachable")):
+        from ml.feature_generator import query_opentargets_live_associations
+        res = query_opentargets_live_associations("ENSG00000067900")
+        assert res == {}
+
+
+# ===========================================================================
+# PHASE 3 — MULTI-OMICS EXPANSION & CLINICAL EVIDENCE VALIDATION TESTS
+# ===========================================================================
+
+def test_phase3_1_valid_transcriptomic_signature_retrieval():
+    """
+    Test Phase 3.1: Valid transcriptomic signature retrieval and CMAP reversal scoring.
+    """
+    from app.services.transcriptomics_service import TranscriptomicsService
+    res = TranscriptomicsService.evaluate_connectivity("Fasudil", "Pulmonary Arterial Hypertension")
+    assert res["status"] == "available"
+    assert res["drug"] == "Fasudil"
+    assert res["disease"] == "Pulmonary Arterial Hypertension"
+    assert res["connectivity_score"] is not None
+    assert res["connectivity_score"] < -0.30  # Strong therapeutic reversal
+    assert res["directionality"] == "strong_reversal"
+    assert res["p_value"] <= 0.05
+    assert res["cell_context"] == "HA1E"
+    assert "NIH LINCS L1000" in res["provenance"]
+
+
+def test_phase3_2_drug_identifier_resolution():
+    """
+    Test Phase 3.2: Drug alias resolution for transcriptomics.
+    """
+    from app.services.transcriptomics_service import TranscriptomicsService
+    # Glucophage -> Metformin
+    res_met = TranscriptomicsService.evaluate_connectivity("Glucophage", "Breast Carcinoma")
+    assert res_met["status"] == "available"
+    assert res_met["drug"] == "Metformin"
+
+    # HA-1077 -> Fasudil
+    res_fas = TranscriptomicsService.evaluate_connectivity("ha-1077", "Pulmonary Arterial Hypertension")
+    assert res_fas["status"] == "available"
+    assert res_fas["drug"] == "Fasudil"
+
+
+def test_phase3_3_missing_signature_unavailable_status():
+    """
+    Test Phase 3.3: Explicit unavailable status when drug has no LINCS L1000 signature.
+    """
+    from app.services.transcriptomics_service import TranscriptomicsService
+    res = TranscriptomicsService.evaluate_connectivity("NonExistentDrug999", "Colorectal Cancer")
+    assert res["status"] == "unavailable"
+    assert res["connectivity_score"] is None
+    assert res["directionality"] == "unavailable"
+    assert "No validated LINCS L1000 perturbation signature" in res["interpretation"]
+
+
+def test_phase3_4_incomplete_signature_handling():
+    """
+    Test Phase 3.4: Incomplete gene-expression data handling.
+    """
+    from app.services.transcriptomics_service import TranscriptomicsService
+    tau, p_val, matched = TranscriptomicsService.calculate_connectivity_score(
+        drug_modz={"GAPDH": 0.01},  # Only 1 gene matches
+        up_genes=["MYC", "CCND1"],
+        down_genes=["TP53", "PTEN"]
+    )
+    assert tau == 0.0
+    assert p_val == 1.0
+    assert matched == 0
+
+
+def test_phase3_5_directionality_and_scoring_behavior():
+    """
+    Test Phase 3.5: Directionality distinguishing reversal from concordance.
+    """
+    from app.services.transcriptomics_service import TranscriptomicsService
+    # Construct synthetic concordant signature (drug increases disease-up genes, decreases disease-down genes)
+    concordant_modz = {
+        "MYC": +3.0, "CCND1": +2.8, "TP53": -2.5, "PTEN": -2.2
+    }
+    tau_conc, _, _ = TranscriptomicsService.calculate_connectivity_score(
+        drug_modz=concordant_modz,
+        up_genes=["MYC", "CCND1"],
+        down_genes=["TP53", "PTEN"]
+    )
+    assert tau_conc > 0.30  # Strong positive concordance (disease mimicking / contraindication)
+
+    # Reversal signature (drug decreases disease-up genes, increases disease-down genes)
+    reversal_modz = {
+        "MYC": -3.0, "CCND1": -2.8, "TP53": +2.5, "PTEN": +2.2
+    }
+    tau_rev, _, _ = TranscriptomicsService.calculate_connectivity_score(
+        drug_modz=reversal_modz,
+        up_genes=["MYC", "CCND1"],
+        down_genes=["TP53", "PTEN"]
+    )
+    assert tau_rev < -0.30  # Strong negative reversal
+
+
+def test_phase3_6_separation_from_xgboost_scores():
+    """
+    Test Phase 3.6: Strict segregation between XGBoost likelihood and transcriptomic connectivity.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Fasudil", "search_type": "drug_to_disease"},
+        headers=researcher_headers
+    )
+    assert res.status_code == 200
+    data = res.json()
+    
+    # ML Prediction is stored in candidates[0].prediction_score
+    ml_cand = data["candidates"][0]
+    assert ml_cand["prediction_score"] >= 0.0 and ml_cand["prediction_score"] <= 1.0
+    
+    # Transcriptomic connectivity is segregated in data["transcriptomic_connectivity"]
+    tc = data["transcriptomic_connectivity"]
+    assert tc is not None
+    assert tc["connectivity_score"] <= 0.0  # CMAP tau score in [-1.0, +1.0]
+    assert tc["scoring_method"].startswith("Broad Institute CMAP")
+
+
+def test_phase3_7_clinical_trial_completed_with_results():
+    """
+    Test Phase 3.7: Adversarial trial agent classification for completed study with results.
+    """
+    from app.services.clinical_trial_challenge import ClinicalTrialChallengeAgent
+    trial = {
+        "nct_id": "NCT01185366",
+        "title": "Study of Everolimus in Kidney Cancer",
+        "overall_status": "COMPLETED",
+        "why_stopped": None,
+        "phases": ["Phase 2"],
+        "conditions": ["Kidney Cancer"],
+        "interventions": ["Drug: Everolimus"],
+        "primary_outcomes": ["Overall survival"],
+        "has_results": True,
+        "url": "https://clinicaltrials.gov/study/NCT01185366"
+    }
+    c = ClinicalTrialChallengeAgent.classify_trial_finding(trial, "Everolimus", "Kidney Cancer")
+    assert c["classification"] == "COMPLETED_WITH_RESULTS"
+    assert c["challenge_impact"] == "SUPPORTIVE_OR_EVALUATED"
+
+
+def test_phase3_8_clinical_trial_terminated_negative_results():
+    """
+    Test Phase 3.8: Adversarial trial agent classification for termination due to inefficacy.
+    """
+    from app.services.clinical_trial_challenge import ClinicalTrialChallengeAgent
+    trial = {
+        "nct_id": "NCT01234567",
+        "title": "Phase 2 Evaluation of Candidate in Pancreatic Cancer",
+        "overall_status": "TERMINATED",
+        "why_stopped": "Terminated early at pre-specified interim analysis due to lack of efficacy and futility",
+        "phases": ["Phase 2"],
+        "conditions": ["Pancreatic Neoplasm"],
+        "interventions": ["Drug: Candidate Drug"],
+        "primary_outcomes": ["Progression-free survival"],
+        "has_results": True,
+        "url": "https://clinicaltrials.gov/study/NCT01234567"
+    }
+    c = ClinicalTrialChallengeAgent.classify_trial_finding(trial, "Candidate Drug", "Pancreatic Neoplasm")
+    assert c["classification"] == "TERMINATED_EFFICACY_FAILURE"
+    assert c["challenge_impact"] == "HIGH_CHALLENGE"
+    assert "directly challenges" in c["explanation"]
+
+
+def test_phase3_9_clinical_trial_terminated_operational_inconclusive():
+    """
+    Test Phase 3.9: Terminated trial without results classified as inconclusive, NOT failed.
+    """
+    from app.services.clinical_trial_challenge import ClinicalTrialChallengeAgent
+    trial = {
+        "nct_id": "NCT00670202",
+        "title": "Rho Kinase (ROCK) Inhibition in Carotid Atherosclerosis",
+        "overall_status": "TERMINATED",
+        "why_stopped": "Slow enrollment",
+        "phases": ["Phase 2"],
+        "conditions": ["Carotid Atherosclerosis"],
+        "interventions": ["Drug: Fasudil"],
+        "primary_outcomes": ["Endothelial reactivity"],
+        "has_results": False,
+        "url": "https://clinicaltrials.gov/study/NCT00670202"
+    }
+    c = ClinicalTrialChallengeAgent.classify_trial_finding(trial, "Fasudil", "Atherosclerosis")
+    assert c["classification"] == "TERMINATED_OPERATIONAL_INCONCLUSIVE"
+    assert c["challenge_impact"] == "INCONCLUSIVE"
+    assert "does NOT demonstrate biological or clinical inefficacy" in c["explanation"]
+
+
+def test_phase3_10_clinical_trial_recruiting():
+    """
+    Test Phase 3.10: Active/recruiting trial classification.
+    """
+    from app.services.clinical_trial_challenge import ClinicalTrialChallengeAgent
+    trial = {
+        "nct_id": "NCT04567890",
+        "title": "Ongoing Phase 3 Clinical Evaluation",
+        "overall_status": "RECRUITING",
+        "why_stopped": None,
+        "phases": ["Phase 3"],
+        "conditions": ["Colorectal Cancer"],
+        "interventions": ["Drug: Metformin"],
+        "primary_outcomes": ["Recurrence rate"],
+        "has_results": False,
+        "url": "https://clinicaltrials.gov/study/NCT04567890"
+    }
+    c = ClinicalTrialChallengeAgent.classify_trial_finding(trial, "Metformin", "Colorectal Cancer")
+    assert c["classification"] == "ACTIVE_CLINICAL_EVALUATION"
+    assert c["challenge_impact"] == "SUPPORTIVE_INVESTIGATIONAL"
+
+
+def test_phase3_11_clinical_trial_no_matching_trials():
+    """
+    Test Phase 3.11: Graceful handling of hypothesis with no matching clinical trials.
+    """
+    import asyncio
+    from app.services.clinical_trial_challenge import ClinicalTrialChallengeAgent
+    res = asyncio.run(ClinicalTrialChallengeAgent.audit_hypothesis("HypotheticalCompoundX", "ExtremelyRareConditionZ"))
+    assert res["overall_challenge_level"] == "UNRESOLVED_NO_CLINICAL_TRIALS"
+    assert res["total_trials_evaluated"] == 0
+    assert "remains strictly preclinical" in res["summary"]
+
+
+def test_phase3_12_multidrug_known_interaction():
+    """
+    Test Phase 3.12: Polypharmacy safety engine detects known contraindicated interaction.
+    """
+    from app.database import SessionLocal
+    from app.services.safety_service import MultiDrugSafetyService
+    db = SessionLocal()
+    try:
+        res = MultiDrugSafetyService.analyze_regimen(db, ["Sildenafil", "Nitroglycerin", "Metformin"])
+        assert res["contraindications_count"] >= 1
+        assert res["overall_risk_category"] == "CONTRAINDICATED / CRITICAL"
+        assert res["overall_risk_score"] >= 40.0
+        assert len(res["pairwise_interactions"]) >= 1
+        interaction = res["pairwise_interactions"][0]
+        assert interaction["severity"] == "CONTRAINDICATED"
+        assert "hypotension" in interaction["mechanism"].lower() or "cgmp" in interaction["mechanism"].lower()
+    finally:
+        db.close()
+
+
+def test_phase3_13_multidrug_no_retrieved_interaction():
+    """
+    Test Phase 3.13: Polypharmacy safety engine explicitly tracks unmonitored pairs.
+    """
+    from app.database import SessionLocal
+    from app.services.safety_service import MultiDrugSafetyService
+    db = SessionLocal()
+    try:
+        res = MultiDrugSafetyService.analyze_regimen(db, ["Metformin", "Fasudil"])
+        assert res["contraindications_count"] == 0
+        assert res["overall_risk_category"] == "NO DOCUMENTED INTERACTIONS"
+        assert res["overall_risk_score"] == 0.0
+        assert len(res["unmonitored_pairs"]) == 1
+        assert "Absence of record does NOT guarantee clinical safety" in res["unmonitored_pairs"][0]["notice"]
+    finally:
+        db.close()
+
+
+def test_phase3_14_multidrug_unknown_medication():
+    """
+    Test Phase 3.14: Polypharmacy safety engine handles unindexed medication.
+    """
+    from app.database import SessionLocal
+    from app.services.safety_service import MultiDrugSafetyService
+    db = SessionLocal()
+    try:
+        res = MultiDrugSafetyService.analyze_regimen(db, ["UnindexedDrug123", "Metformin"])
+        assert res["total_medications"] == 2
+        assert len(res["unmonitored_pairs"]) == 1
+    finally:
+        db.close()
+
+
+def test_phase3_15_multidrug_duplicates_and_normalization():
+    """
+    Test Phase 3.15: Medication name normalization and deduplication.
+    """
+    from app.database import SessionLocal
+    from app.services.safety_service import MultiDrugSafetyService
+    db = SessionLocal()
+    try:
+        # Pass duplicate entries with whitespace and dosage tokens
+        meds = ["Metformin", "metformin", " Metformin 500mg ", "Sildenafil"]
+        res = MultiDrugSafetyService.analyze_regimen(db, meds)
+        # Should deduplicate down to 2 distinct medications (Metformin and Sildenafil)
+        assert res["total_medications"] == 2
+        assert res["total_pairs_evaluated"] == 1
+    finally:
+        db.close()
+
+
+def test_phase3_16_patient_regimen_safety_and_auth():
+    """
+    Test Phase 3.16: Authenticated patient regimen safety check endpoint.
+    """
+    patient_headers = get_auth_headers("sarah.jenkins@patient-portal.org")
+    res = client.post(
+        "/api/patient/regimen/safety-check",
+        json=["Metformin", "Aspirin"],
+        headers=patient_headers
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert "analysis_id" in data
+    assert "overall_risk_category" in data
+    assert data["total_medications"] == 2
+    assert "safety_disclaimer" in data
+
+
+def test_phase3_17_e2e_investigation_with_phase3_evidence():
+    """
+    Test Phase 3.17: Full E2E investigation returning transcriptomics and clinical trial challenge.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Fasudil", "search_type": "drug_to_disease"},
+        headers=researcher_headers
+    )
+    assert res.status_code == 200
+    data = res.json()
+    
+    # 6 canonical workflow steps with integrated multi-omics and adversarial challenge
+    steps = data["completed_steps"]
+    assert len(steps) == 6
+    step_names = [s["name"] for s in steps]
+    assert "Literature & Multi-Omics Evidence Retrieval" in step_names
+    assert "Evidence Boundary, Contradiction & Adversarial Audit" in step_names
+
+    
+    # Evidence payloads present
+    assert "transcriptomic_connectivity" in data
+    assert data["transcriptomic_connectivity"]["status"] == "available"
+    assert "clinical_trial_challenge" in data
+    assert "overall_challenge_level" in data["clinical_trial_challenge"]
+
+
+def test_phase3_18_disease_to_drug_workflow_preserved():
+    """
+    Test Phase 3.18: Disease-to-drug direction preservation with Phase 3 integration.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Colorectal Cancer", "search_type": "disease_to_drug"},
+        headers=researcher_headers
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["search_type"] == "disease_to_drug"
+    assert data["query_type"] == "disease"
+    assert len(data["candidates"]) > 0
+
+
+def test_phase3_19_persistence_and_retrieval_with_phase3_evidence():
+    """
+    Test Phase 3.19: Persisted investigations preserve transcriptomic and trial challenge data.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Metformin", "search_type": "drug_to_disease"},
+        headers=researcher_headers
+    )
+    assert res.status_code == 200
+    wf_id = res.json()["workflow_id"]
+
+    get_res = client.get(f"/api/candidates/investigation/{wf_id}", headers=researcher_headers)
+    assert get_res.status_code == 200
+    persisted = get_res.json()
+    assert persisted["workflow_id"] == wf_id
+    assert "transcriptomic_connectivity" in persisted
+    assert persisted["transcriptomic_connectivity"]["drug"] == "Metformin"
+    assert "clinical_trial_challenge" in persisted
+
+
+def test_phase3_20_rbac_boundaries_for_safety_and_regimens():
+    """
+    Test Phase 3.20: Enforce strict role-based access control boundaries.
+    """
+    doctor_headers = get_auth_headers("marcus.chen.md@metropolitan-health.org")
+    patient_headers = get_auth_headers("sarah.jenkins@patient-portal.org")
+
+    # Doctor can access doctor safety regimen analysis
+    res_doc = client.post(
+        "/api/doctor/safety/analyze-regimen",
+        json={"medications": ["Sildenafil", "Nitroglycerin"]},
+        headers=doctor_headers
+    )
+    assert res_doc.status_code == 200
+
+    # Patient is forbidden from doctor safety endpoint (403)
+    res_pat_on_doc = client.post(
+        "/api/doctor/safety/analyze-regimen",
+        json={"medications": ["Sildenafil", "Nitroglycerin"]},
+        headers=patient_headers
+    )
+    assert res_pat_on_doc.status_code == 403
+
+
+# ===========================================================================
+# AUDIT REGRESSION TESTS (TASKS 1 - 5)
+# ===========================================================================
+
+def test_audit_task1_ml_feature_contract_and_distinct_rankings():
+    """
+    Task 1: Verify XGBoost live model contract, finite inputs, and distinct candidate sets.
+    """
+    import numpy as np
+    from ml.predict_v4 import FEATURES, predict_for_drug
+    from ml.feature_generator import generate_dynamic_features_for_drug
+
+    # 1. Exact 39-feature contract
+    assert len(FEATURES) == 39
+    assert FEATURES[0] == "shared_targets"
+    assert FEATURES[38] == "has_molecular_structure"
+
+    # 2. Distinct queries yield distinct candidate lists and scores
+    fasudil_res = predict_for_drug("CHEMBL38380", top_k=5)
+    everolimus_res = predict_for_drug("CHEMBL1908360", top_k=5)
+    assert fasudil_res["candidate_count"] > 0
+    assert everolimus_res["candidate_count"] > 0
+    assert abs(fasudil_res["candidates"][0]["score"] - everolimus_res["candidates"][0]["score"]) > 1e-4
+
+    # 3. Insufficient features drug returns empty candidate list
+    niclosamide_res = predict_for_drug("CHEMBL1448", top_k=5)
+    assert niclosamide_res["candidate_count"] == 0
+    assert len(niclosamide_res["candidates"]) == 0
+
+    # 4. Input vectors contain only finite values
+    cands, reason = generate_dynamic_features_for_drug("CHEMBL38380")
+    assert len(cands) > 0
+    for feat in FEATURES:
+        val = cands[0].get(feat, 0.0)
+        assert val is not None
+        assert np.isfinite(float(val))
+
+
+def test_audit_task2_transcriptomics_provenance_and_reproducibility():
+    """
+    Task 2: Verify transcriptomic connectivity reproducibility and explicit unavailable status.
+    """
+    from app.services.transcriptomics_service import TranscriptomicsService
+
+    # 1. Deterministic reproducible calculation for Fasudil in PAH
+    res1 = TranscriptomicsService.evaluate_connectivity("Fasudil", "Pulmonary Arterial Hypertension")
+    res2 = TranscriptomicsService.evaluate_connectivity("Fasudil", "Pulmonary Arterial Hypertension")
+    assert res1["status"] == "available"
+    assert res1["connectivity_score"] == res2["connectivity_score"]
+    assert res1["cell_context"] == "HA1E"
+    assert res1["dose"] == "10.0 uM"
+    assert res1["exposure_duration"] == "24 h"
+    assert "GSE113439" in res1["disease_signature_source"]
+    assert res1["p_value"] <= 0.05
+
+    # 2. Unindexed drug returns explicit unavailable status
+    unindexed = TranscriptomicsService.evaluate_connectivity("SyntheticNovelDrugXYZ", "Glioblastoma")
+    assert unindexed["status"] == "unavailable"
+    assert unindexed["connectivity_score"] is None
+    assert "no validated" in unindexed["interpretation"].lower() or "no characterized" in unindexed["limitations"].lower()
+
+
+def test_audit_task3_nct01234567_isolation_and_challenge_classification():
+    """
+    Task 3: Verify synthetic trial NCT01234567 is not in database and trial classifier distinguishes reasons.
+    """
+    from app.models.models import ClinicalTrialRecord
+    from app.services.clinical_trial_challenge import ClinicalTrialChallengeAgent
+
+    # 1. NCT01234567 strictly absent from test and seed database
+    db = TestingSessionLocal()
+    try:
+        match = db.query(ClinicalTrialRecord).filter(
+            ClinicalTrialRecord.nct_id.ilike("%NCT01234567%")
+        ).first()
+        assert match is None, "CRITICAL: NCT01234567 found in database!"
+    finally:
+        db.close()
+
+    # 2. Distinguishes operational termination from inefficacy failure
+    op_trial = {
+        "nct_id": "NCT00000001",
+        "title": "Atherosclerosis Trial",
+        "overall_status": "TERMINATED",
+        "why_stopped": "Slow enrollment due to operational hurdles",
+        "phases": ["Phase 2"],
+        "conditions": ["Atherosclerosis"],
+        "interventions": ["Drug: Fasudil"],
+        "primary_outcomes": ["Reactivity"],
+        "has_results": False,
+        "url": "https://clinicaltrials.gov/study/NCT00000001"
+    }
+    c_op = ClinicalTrialChallengeAgent.classify_trial_finding(op_trial, "Fasudil", "Atherosclerosis")
+    assert c_op["classification"] == "TERMINATED_OPERATIONAL_INCONCLUSIVE"
+    assert c_op["challenge_impact"] == "INCONCLUSIVE"
+
+    fail_trial = {
+        "nct_id": "NCT00000002",
+        "title": "Oncology Trial",
+        "overall_status": "TERMINATED",
+        "why_stopped": "Pre-specified futility stopping boundary crossed; lack of efficacy",
+        "phases": ["Phase 3"],
+        "conditions": ["Pancreatic Neoplasm"],
+        "interventions": ["Drug: Everolimus"],
+        "primary_outcomes": ["OS"],
+        "has_results": True,
+        "url": "https://clinicaltrials.gov/study/NCT00000002"
+    }
+    c_fail = ClinicalTrialChallengeAgent.classify_trial_finding(fail_trial, "Everolimus", "Pancreatic Neoplasm")
+    assert c_fail["classification"] == "TERMINATED_EFFICACY_FAILURE"
+    assert c_fail["challenge_impact"] == "HIGH_CHALLENGE"
+
+
+def test_audit_task4_polypharmacy_pairwise_combinations_and_unmonitored():
+    """
+    Task 4: Verify N*(N-1)/2 matrix, deduplication, unmonitored safety warnings, and RBAC.
+    """
+    from app.services.safety_service import MultiDrugSafetyService
+
+    db = TestingSessionLocal()
+    try:
+        # 1. 4 meds -> 6 unique pairs
+        meds = ["Sildenafil", "Nitroglycerin", "Metformin", "Lisinopril"]
+        res = MultiDrugSafetyService.analyze_regimen(db, meds)
+        assert res["total_medications"] == 4
+        assert res["total_pairs_evaluated"] == 6
+
+        # 2. Known DDI has verified monograph source
+        sil_nitro = next((p for p in res["pairwise_interactions"] if "sildenafil" in p["drug_a"].lower() or "sildenafil" in p["drug_b"].lower()), None)
+        assert sil_nitro is not None
+        assert sil_nitro["verified_source"] is not None
+        assert sil_nitro["severity"] == "CONTRAINDICATED"
+
+        # 3. Unmonitored pairs contain mandatory warning
+        assert len(res["unmonitored_pairs"]) > 0
+        for u in res["unmonitored_pairs"]:
+            assert "Absence of record does NOT guarantee clinical safety" in u["notice"]
+
+        # 4. Single-drug and duplicates handling
+        res_single = MultiDrugSafetyService.analyze_regimen(db, ["Metformin", "Metformin 500mg"])
+        assert res_single["total_medications"] == 1
+        assert res_single["overall_risk_score"] == 0.0
+        assert res_single["overall_risk_category"] == "Insufficient Medications"
+    finally:
+        db.close()
+
+
+def test_audit_task5_investigation_persistence_and_refresh_recovery():
+    """
+    Task 5: Verify investigation persistence round-trip and workflow retrieval for browser reload.
+    """
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    inv_res = client.post(
+        "/api/candidates/investigate",
+        params={"query": "Fasudil", "search_type": "drug_to_disease"},
+        headers=researcher_headers
+    )
+    assert inv_res.status_code == 200
+    wf_id = inv_res.json()["workflow_id"]
+
+    # Retrieve by workflow_id (exact endpoint used by frontend on page reload)
+    recov_res = client.get(f"/api/candidates/investigation/{wf_id}", headers=researcher_headers)
+    assert recov_res.status_code == 200
+    recov_data = recov_res.json()
+    assert recov_data["workflow_id"] == wf_id
+    assert recov_data["query_entity"].upper() == "FASUDIL"
+    assert len(recov_data["candidates"]) > 0
+    assert "transcriptomic_connectivity" in recov_data
+    assert "clinical_trial_challenge" in recov_data
+
+
+

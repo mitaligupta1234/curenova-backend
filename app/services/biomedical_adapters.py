@@ -121,3 +121,41 @@ class BiomedicalAdapter:
         except Exception:
             pass
         return None
+
+    @staticmethod
+    async def search_openfda_events(drug_name: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Queries OpenFDA Drug Adverse Events API for reported post-marketing adverse events.
+        Note: Adverse event reports represent post-marketing observations, not confirmed causality.
+        """
+        url = f"{settings.OPENFDA_BASE_URL}/event.json"
+        params = {
+            "search": f'patient.drug.medicinalproduct:"{drug_name}"',
+            "limit": limit
+        }
+        if settings.OPENFDA_API_KEY:
+            params["api_key"] = settings.OPENFDA_API_KEY
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                res = await client.get(url, params=params)
+                if res.status_code == 200:
+                    data = res.json()
+                    results = []
+                    for report in data.get("results", []):
+                        reactions = [
+                            r.get("reactionmeddrapt")
+                            for r in report.get("patient", {}).get("reaction", [])
+                            if r.get("reactionmeddrapt")
+                        ]
+                        results.append({
+                            "safety_report_id": report.get("safetyreportid"),
+                            "received_date": report.get("receiptdate"),
+                            "serious": report.get("serious") == "1",
+                            "reactions": reactions[:5],
+                            "source": "FDA Adverse Event Reporting System (FAERS) Live API"
+                        })
+                    return results
+        except Exception:
+            pass
+        return []
+

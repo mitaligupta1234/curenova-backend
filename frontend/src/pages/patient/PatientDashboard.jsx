@@ -51,7 +51,7 @@ export const PatientDashboard = () => {
   useEffect(() => {
     safetyService
       .getCatalog()
-      .then((res) => setCatalog(res.catalog || []))
+      .then((res) => setCatalog(Array.isArray(res) ? res : (res.catalog || [])))
       .catch((err) => console.error('Failed to load catalog', err));
   }, []);
 

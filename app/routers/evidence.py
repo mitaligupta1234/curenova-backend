@@ -17,20 +17,30 @@ def get_evidence(
     direction: Optional[str] = Query(None, max_length=50),  # supporting, contradictory, inconclusive
     candidate_id: Optional[int] = None,
     search: Optional[str] = Query(None, max_length=150),
+    q: Optional[str] = Query(None, max_length=150),
+    source: Optional[str] = Query(None, max_length=100),
+    evidence_type: Optional[str] = Query(None, max_length=100),
     db: Session = Depends(get_db)
 ):
     query = db.query(EvidenceRecord)
     if candidate_id:
         query = query.filter(EvidenceRecord.candidate_id == candidate_id)
-    if study_type:
-        query = query.filter(EvidenceRecord.study_type.ilike(f"%{study_type}%"))
+    eff_study = study_type or evidence_type
+    if eff_study:
+        query = query.filter(EvidenceRecord.study_type.ilike(f"%{eff_study}%"))
     if direction:
         query = query.filter(EvidenceRecord.evidence_direction == direction)
-    if search:
+    if source:
         query = query.filter(
-            (EvidenceRecord.title.ilike(f"%{search}%")) |
-            (EvidenceRecord.excerpt.ilike(f"%{search}%")) |
-            (EvidenceRecord.authors.ilike(f"%{search}%"))
+            (EvidenceRecord.journal.ilike(f"%{source}%")) |
+            (EvidenceRecord.provenance_url.ilike(f"%{source}%"))
+        )
+    eff_search = search or q
+    if eff_search:
+        query = query.filter(
+            (EvidenceRecord.title.ilike(f"%{eff_search}%")) |
+            (EvidenceRecord.excerpt.ilike(f"%{eff_search}%")) |
+            (EvidenceRecord.authors.ilike(f"%{eff_search}%"))
         )
     return query.all()
 

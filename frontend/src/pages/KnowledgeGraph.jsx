@@ -17,13 +17,22 @@ import Badge from '../components/ui/Badge';
 
 const TYPE_COLORS = {
   Drug: { bg: '#0284c7', text: '#ffffff', border: '#0369a1' },
+  drug: { bg: '#0284c7', text: '#ffffff', border: '#0369a1' },
   Disease: { bg: '#e11d48', text: '#ffffff', border: '#be123c' },
+  disease: { bg: '#e11d48', text: '#ffffff', border: '#be123c' },
   Protein: { bg: '#0d9488', text: '#ffffff', border: '#0f766e' },
+  protein: { bg: '#0d9488', text: '#ffffff', border: '#0f766e' },
   Gene: { bg: '#8b5cf6', text: '#ffffff', border: '#7c3aed' },
+  gene: { bg: '#8b5cf6', text: '#ffffff', border: '#7c3aed' },
   Pathway: { bg: '#d97706', text: '#ffffff', border: '#b45309' },
+  pathway: { bg: '#d97706', text: '#ffffff', border: '#b45309' },
   Paper: { bg: '#64748b', text: '#ffffff', border: '#475569' },
+  paper: { bg: '#64748b', text: '#ffffff', border: '#475569' },
+  publication: { bg: '#64748b', text: '#ffffff', border: '#475569' },
   ClinicalTrial: { bg: '#2563eb', text: '#ffffff', border: '#1d4ed8' },
+  trial: { bg: '#2563eb', text: '#ffffff', border: '#1d4ed8' },
   SafetySignal: { bg: '#dc2626', text: '#ffffff', border: '#991b1b' },
+  safetysignal: { bg: '#dc2626', text: '#ffffff', border: '#991b1b' },
 };
 
 export const KnowledgeGraph = () => {
@@ -65,10 +74,11 @@ export const KnowledgeGraph = () => {
 
     return nodes.map((node, index) => {
       const angle = (index / nodes.length) * 2 * Math.PI;
+      const typeLower = (node.type || '').toLowerCase();
       let radius = 180;
-      if (node.type === 'Disease') radius = 80;
-      else if (node.type === 'Drug') radius = 150;
-      else if (node.type === 'Protein' || node.type === 'Gene') radius = 230;
+      if (typeLower === 'disease') radius = 80;
+      else if (typeLower === 'drug') radius = 150;
+      else if (typeLower === 'protein' || typeLower === 'gene') radius = 230;
       else radius = 280;
 
       const x = centerX + Math.cos(angle) * radius;

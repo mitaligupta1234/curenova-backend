@@ -229,3 +229,37 @@ class ResearchFeedback(Base):
 
     user = relationship("User")
     candidate = relationship("CandidatePrediction")
+
+class InvestigationRun(Base):
+    __tablename__ = "investigation_runs"
+    id = Column(Integer, primary_key=True, index=True)
+    workflow_id = Column(String(100), unique=True, index=True, nullable=False)
+    query = Column(String(255), index=True, nullable=False)
+    entity_resolved_name = Column(String(255), nullable=False)
+    entity_type = Column(String(50), default="Disease")
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    user_role = Column(String(50), default="researcher")
+    provenance_mode = Column(String(50), default="deterministic_fallback")
+    candidate_count = Column(Integer, default=0)
+    top_candidate_name = Column(String(255), nullable=True)
+    top_candidate_score = Column(Float, nullable=True)
+    results_json = Column(Text, nullable=False)  # JSON payload of AgentWorkflowResponse
+    created_at = Column(DateTime, default=utc_now)
+
+    user = relationship("User")
+
+class PatientMedication(Base):
+    __tablename__ = "patient_medications"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    drug_name = Column(String(255), nullable=False)
+    dosage = Column(String(100), default="As prescribed")
+    frequency = Column(String(100), default="Daily")
+    time_of_day = Column(String(50), default="Morning (8:00 AM)")
+    taken = Column(Boolean, default=False)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
+
+    user = relationship("User")
+

@@ -3,10 +3,12 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 from ..database import get_db
 from ..models.models import DrugInteraction, ClinicalTrialRecord, Drug, User
-from ..schemas.schemas import DDIAlert, ClinicalTrialOut
+from ..schemas.schemas import DDIAlert, ClinicalTrialOut, RegimenAnalysisRequest, RegimenAnalysisOut
 from ..services.biomedical_adapters import BiomedicalAdapter
+from ..services.safety_service import MultiDrugSafetyService
 from ..dependencies.auth import require_doctor
 from ..services.auth_service import get_client_ip, outbound_rate_limiter
+
 
 router = APIRouter(prefix="/doctor", tags=["Doctor Portal — Clinical Evidence & Safety"])
 
@@ -92,6 +94,46 @@ async def fetch_live_clinical_trials(
         "results": trials
     }
 
+@router.get("/adverse-events")
+async def get_adverse_events(
+    request: Request,
+    drug: str = Query(..., min_length=2, max_length=100, description="Drug name to query OpenFDA for adverse events"),
+    limit: int = Query(5, ge=1, le=20),
+    current_user: User = Depends(require_doctor)
+):
+    """
+    Fetches real post-marketing adverse events from OpenFDA FAERS database.
+    Note: OpenFDA records represent spontaneous post-marketing reports and do NOT confirm causality.
+    """
+    client_ip = get_client_ip(request)
+    outbound_rate_limiter.check_rate_limit(f"{client_ip}:openfda")
+    events = await BiomedicalAdapter.search_openfda_events(drug_name=drug, limit=limit)
+    return {
+        "drug": drug,
+        "count": len(events),
+        "results": events,
+        "disclaimer": (
+            "OpenFDA post-marketing adverse event reports represent spontaneous submissions. "
+            "They do NOT establish causal drug relationships or incidence rates."
+        )
+    }
+
+@router.post("/safety/analyze-regimen", response_model=RegimenAnalysisOut)
+def analyze_medication_regimen(
+    req: RegimenAnalysisRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_doctor)
+):
+    """
+    Exhaustively audits an arbitrary patient medication regimen for combinatorial
+    drug-drug interactions, contraindications, and unmonitored drug pairs.
+    """
+    return MultiDrugSafetyService.analyze_regimen(
+        db=db,
+        medications=req.medications,
+        patient_context=req.patient_context
+    )
+
 @router.get("/overview")
 def get_clinical_overview(db: Session = Depends(get_db)):
     trial_count = db.query(ClinicalTrialRecord).count()
@@ -109,3 +151,4 @@ def get_clinical_overview(db: Session = Depends(get_db)):
             "and must NOT be utilized as autonomous prescribing directives."
         )
     }
+
