@@ -5,9 +5,15 @@ import uuid
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from sqlalchemy.orm import Session
-from ..models.models import Drug, Disease, CandidatePrediction, KnowledgeEdge, InvestigationRun
+from ..models.models import Drug, Disease, CandidatePrediction, KnowledgeEdge, InvestigationRun, EvidenceRecord
 from .biomedical_adapters import BiomedicalAdapter
 from .llm_service import get_llm_client, BaseLLMClient
+
+try:
+    from ml.feature_generator import get_molecular_dict
+except Exception:
+    def get_molecular_dict():
+        return {}
 from .biomedical_agents import (
     LiteratureScout, TargetMechanist, SafetyAssessor, ChallengeAgent, Synthesizer,
     NON_CLINICAL_DISCLAIMER
@@ -30,8 +36,9 @@ class AgenticOrchestrator:
     Guarantees provenance auditing and scientific research boundaries.
     """
 
-    @staticmethod
+    @classmethod
     async def run_investigation(
+        cls,
         db: Session,
         query: str,
         search_type: str = "drug_to_disease",
@@ -42,13 +49,99 @@ class AgenticOrchestrator:
     ) -> Dict[str, Any]:
         start_time = time.time()
         workflow_id = f"WF-CURENOVA-{int(start_time * 1000)}-{uuid.uuid4().hex[:6]}"
-        steps = []
-        uncertainties = []
 
         # Determine active LLM client and provenance mode
         active_llm = llm_client if llm_client is not None else get_llm_client()
         provenance_mode = "llm" if active_llm is not None else "deterministic_fallback"
         llm_provider = settings.LLM_PROVIDER if active_llm is not None else "none"
+
+        try:
+            return await cls._run_investigation_pipeline(
+                db=db,
+                query=query,
+                search_type=search_type,
+                user_role=user_role,
+                demo_mode=demo_mode,
+                active_llm=active_llm,
+                provenance_mode=provenance_mode,
+                llm_provider=llm_provider,
+                workflow_id=workflow_id,
+                start_time=start_time,
+                user_id=user_id
+            )
+        except Exception as pipeline_exc:
+            logger.error("Unhandled pipeline exception in run_investigation (%s): %s", workflow_id, pipeline_exc, exc_info=True)
+            execution_duration_ms = int((time.time() - start_time) * 1000)
+            failed_payload = {
+                "workflow_id": workflow_id,
+                "query_entity": query,
+                "queried_entity": {"name": query, "type": "Error", "query_type": search_type},
+                "entity_type": "Error",
+                "query_type": "drug" if search_type == "drug_to_disease" else "disease",
+                "search_type": search_type,
+                "status": "failed",
+                "execution_duration_ms": execution_duration_ms,
+                "error_message": str(pipeline_exc),
+                "completed_steps": [],
+                "candidate_hypotheses": [],
+                "candidates": [],
+                "synthesis_report": f"Investigation failed due to pipeline error: {pipeline_exc}",
+                "limitations_and_boundary_warning": NON_CLINICAL_DISCLAIMER,
+                "provenance_mode": provenance_mode,
+                "llm_provider": llm_provider if provenance_mode == "llm" else "none",
+                "model_version": settings.VERSION,
+                "structured_synthesis": None,
+                "mechanisms": [],
+                "safety_findings": [],
+                "contradictions": [],
+                "ml_prediction_metadata": {"status": "error", "error": str(pipeline_exc)},
+                "transcriptomic_connectivity": {"status": "error"},
+                "clinical_trial_challenge": {"status": "error"}
+            }
+            try:
+                failed_run = InvestigationRun(
+                    workflow_id=workflow_id,
+                    query=query,
+                    entity_resolved_name=query,
+                    entity_type="Error",
+                    user_id=user_id,
+                    user_role=user_role,
+                    provenance_mode=provenance_mode,
+                    candidate_count=0,
+                    top_candidate_name=None,
+                    top_candidate_score=None,
+                    results_json=json.dumps(failed_payload),
+                    search_type=search_type,
+                    status="failed",
+                    execution_duration_ms=execution_duration_ms,
+                    model_version=settings.VERSION,
+                    error_message=str(pipeline_exc),
+                    created_at=datetime.now(timezone.utc)
+                )
+                db.add(failed_run)
+                db.commit()
+            except Exception as db_exc:
+                logger.error("Failed to persist failed investigation run: %s", db_exc)
+                db.rollback()
+            return failed_payload
+
+    @classmethod
+    async def _run_investigation_pipeline(
+        cls,
+        db: Session,
+        query: str,
+        search_type: str,
+        user_role: str,
+        demo_mode: bool,
+        active_llm: Optional[BaseLLMClient],
+        provenance_mode: str,
+        llm_provider: str,
+        workflow_id: str,
+        start_time: float,
+        user_id: Optional[int]
+    ) -> Dict[str, Any]:
+        steps = []
+        uncertainties = []
 
         # Role 1: Research Planning Agent
         t0 = time.time()
@@ -638,6 +731,9 @@ class AgenticOrchestrator:
             )
         }
 
+        execution_duration_ms = int((time.time() - start_time) * 1000)
+        mol_dict = get_molecular_dict()
+
         response_payload = {
             "workflow_id": workflow_id,
             "query_entity": entity_resolved_name,
@@ -645,6 +741,9 @@ class AgenticOrchestrator:
             "entity_type": entity_type,
             "query_type": query_type,
             "search_type": search_type,
+            "status": "completed",
+            "execution_duration_ms": execution_duration_ms,
+            "error_message": None,
             "completed_steps": steps,
             "candidate_hypotheses": candidates_out,
             "candidates": candidates_out,
@@ -662,7 +761,7 @@ class AgenticOrchestrator:
             "clinical_trial_challenge": trial_challenge_res
         }
 
-        # Persist investigation run to database for history and ID-based retrieval
+        # Atomic Database Persistence
         try:
             inv_run = InvestigationRun(
                 workflow_id=workflow_id,
@@ -676,11 +775,106 @@ class AgenticOrchestrator:
                 top_candidate_name=target_drug if candidates_out else None,
                 top_candidate_score=float(candidates_out[0]["prediction_score"]) if candidates_out else None,
                 results_json=json.dumps(response_payload),
+                search_type=search_type,
+                status="completed",
+                execution_duration_ms=execution_duration_ms,
+                model_version=settings.VERSION,
+                error_message=None,
                 created_at=datetime.now(timezone.utc)
             )
             db.add(inv_run)
+            db.flush()
+
+            persisted_candidates = []
+            for idx, c in enumerate(candidates):
+                c_chembl = getattr(c, "chembl_id", None)
+                mol_feats = mol_dict.get(c_chembl) if c_chembl else None
+                if not mol_feats and getattr(c, "drug_id", None):
+                    mol_feats = mol_dict.get(str(getattr(c, "drug_id")))
+
+                drug_id_val = getattr(c, "drug_id", None)
+                if drug_id_val and not db.query(Drug.id).filter(Drug.id == drug_id_val).first():
+                    drug_id_val = None
+                disease_id_val = getattr(c, "disease_id", None)
+                if disease_id_val and not db.query(Disease.id).filter(Disease.id == disease_id_val).first():
+                    disease_id_val = None
+
+                cand_rec = CandidatePrediction(
+                    project_id=1,
+                    drug_id=drug_id_val,
+                    drug_name=c.drug_name,
+                    chembl_id=c_chembl,
+                    disease_id=disease_id_val,
+                    disease_name=c.disease_name,
+                    model_name=c.model_name,
+                    model_version=c.model_version,
+                    prediction_score=c.prediction_score,
+                    confidence_interval_low=c.confidence_interval_low,
+                    confidence_interval_high=c.confidence_interval_high,
+                    calibration_status=c.calibration_status,
+                    epistemic_uncertainty=c.epistemic_uncertainty,
+                    aleatoric_uncertainty=c.aleatoric_uncertainty,
+                    rank=c.rank,
+                    rationale=c.rationale,
+                    biological_mechanism=getattr(c, "biological_mechanism", None),
+                    status=c.status,
+                    approval_status=c.approval_status,
+                    evidence_count=c.evidence_count,
+                    is_bookmarked=False,
+                    investigation_id=inv_run.id,
+                    workflow_id=workflow_id,
+                    score_type=getattr(c, "score_type", "ranking_score"),
+                    provenance=getattr(c, "provenance", "precomputed_feature_store"),
+                    molecular_features_json=json.dumps(mol_feats) if mol_feats else None,
+                    last_updated=datetime.now(timezone.utc)
+                )
+                db.add(cand_rec)
+                persisted_candidates.append(cand_rec)
+
+            db.flush()
+
+            # Update candidates_out with persisted DB IDs and fields
+            for idx, cand_rec in enumerate(persisted_candidates):
+                if idx < len(candidates_out):
+                    candidates_out[idx]["id"] = cand_rec.id
+                    candidates_out[idx]["investigation_id"] = inv_run.id
+                    candidates_out[idx]["workflow_id"] = workflow_id
+                    if cand_rec.molecular_features_json:
+                        try:
+                            candidates_out[idx]["molecular_features"] = json.loads(cand_rec.molecular_features_json)
+                        except Exception:
+                            pass
+
+            # Persist validated citations as EvidenceRecord entries linked to top candidate
+            if persisted_candidates and structured_synth and getattr(structured_synth, "validated_citations", None):
+                target_cand = persisted_candidates[0]
+                for cit in structured_synth.validated_citations:
+                    ev_title = cit.get("title") or f"Preclinical study for {target_cand.drug_name}"
+                    ev_pmid = str(cit.get("pmid")) if cit.get("pmid") else None
+                    ev_excerpt = cit.get("excerpt") or cit.get("findings") or "Corroborated preclinical interaction finding."
+                    ev_journal = cit.get("journal") or ("PubMed" if ev_pmid else "NCBI Literature")
+                    ev_url = cit.get("url") or (f"https://pubmed.ncbi.nlm.nih.gov/{ev_pmid}" if ev_pmid else None)
+                    ev_record = EvidenceRecord(
+                        candidate_id=target_cand.id,
+                        title=ev_title,
+                        pmid=ev_pmid,
+                        doi=cit.get("doi"),
+                        authors=cit.get("authors"),
+                        journal=ev_journal,
+                        year=int(cit.get("year")) if str(cit.get("year", "")).isdigit() else 2024,
+                        study_type=cit.get("study_type", "In Vitro"),
+                        evidence_direction=cit.get("evidence_direction", "supporting"),
+                        excerpt=ev_excerpt,
+                        sample_size=str(cit.get("sample_size")) if cit.get("sample_size") else None,
+                        provenance_url=ev_url,
+                        created_at=datetime.now(timezone.utc)
+                    )
+                    db.add(ev_record)
+
+            # Re-serialize results_json with updated candidate IDs
+            inv_run.results_json = json.dumps(response_payload)
             db.commit()
-            logger.info("Persisted investigation run %s for query '%s' to database.", workflow_id, query)
+            logger.info("Persisted investigation run %s with %d candidates and evidence records.", workflow_id, len(persisted_candidates))
         except Exception as persist_exc:
             logger.error("Failed to persist investigation run %s: %s", workflow_id, str(persist_exc))
             db.rollback()

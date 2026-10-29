@@ -173,77 +173,95 @@ export const adminService = {
     api.post(`/auth/users/${userId}/approve`, { approval_status: approvalStatus }),
 };
 
+const formatInvestigationResponse = (raw, query = '', searchType = 'drug_to_disease') => {
+  if (!raw) return null;
+  const synthesis = raw.structured_synthesis || {};
+  const effectiveSearchType = raw.search_type || searchType;
+  const isDrugFirst = effectiveSearchType === 'drug_to_disease' || raw.query_type === 'drug';
+  const rawCandidates = raw.candidate_hypotheses || raw.candidates || [];
+
+  return {
+    analysis_id: raw.workflow_id,
+    workflow_id: raw.workflow_id,
+    query: query || raw.query_entity || raw.workflow_id,
+    search_type: effectiveSearchType,
+    query_type: raw.query_type || (isDrugFirst ? 'drug' : 'disease'),
+    status: raw.status || 'completed',
+    execution_duration_ms: raw.execution_duration_ms,
+    disease_detected: isDrugFirst ? (rawCandidates[0]?.disease_name || 'Multiple Indications') : raw.query_entity,
+    query_entity: raw.query_entity,
+    queried_entity: raw.queried_entity || { name: raw.query_entity, type: raw.entity_type, query_type: raw.query_type },
+    entity_type: raw.entity_type,
+    ml_prediction_metadata: raw.ml_prediction_metadata || {},
+    candidates: rawCandidates.map((c, idx) => {
+      const candidateDisplayName = isDrugFirst ? (c.disease_name || c.candidate_name) : (c.drug_name || c.candidate_name);
+      const subtitle = isDrugFirst
+        ? `Investigated Drug: ${c.drug_name || raw.query_entity}`
+        : (c.approval_status || 'Preclinical Repurposing Hypothesis');
+
+      return {
+        id: c.id,
+        candidate_name: candidateDisplayName,
+        candidate_label: isDrugFirst ? 'Proposed Indication' : 'Candidate Drug',
+        drug_name: c.drug_name,
+        disease_name: c.disease_name,
+        original_indication: isDrugFirst ? (c.approval_status || 'Proposed Indication') : (c.approval_status || 'Preclinical Repurposing Hypothesis'),
+        display_title: candidateDisplayName,
+        display_subtitle: subtitle,
+        curenova_ranking: c.curenova_ranking != null ? c.curenova_ranking : (c.prediction_score != null ? Math.round(c.prediction_score * 100) : null),
+        prediction_score: c.prediction_score,
+        score_type: c.score_type,
+        ml_score_available: c.ml_score_available !== false && c.score_type !== 'curated_evidence_benchmark',
+        confidence_interval: c.confidence_interval_low != null && c.confidence_interval_high != null
+          ? `[${c.confidence_interval_low.toFixed(2)}, ${c.confidence_interval_high.toFixed(2)}]`
+          : 'N/A',
+        confidence_interval_low: c.confidence_interval_low,
+        confidence_interval_high: c.confidence_interval_high,
+        evidence_strength: c.evidence_strength || (c.evidence_count >= 3 ? 'high' : c.evidence_count >= 1 ? 'moderate' : 'low'),
+        evidence_count: c.evidence_count,
+        mechanism_summary: c.rationale || c.biological_mechanism || synthesis.proposed_mechanism || 'Target kinase signaling modulation',
+        biological_mechanism: c.biological_mechanism,
+        evidence_passages: synthesis.validated_citations || [],
+        safety_signals: synthesis.safety_concerns || [],
+        missing_data: synthesis.missing_information || [],
+        epistemic_uncertainty: c.epistemic_uncertainty,
+        aleatoric_uncertainty: c.aleatoric_uncertainty,
+        calibration_status: c.calibration_status,
+        is_bookmarked: c.is_bookmarked,
+        rank: c.rank || idx + 1,
+        status: c.status,
+        molecular_features: c.molecular_features || null,
+      };
+    }),
+    synthesis_report: raw.synthesis_report,
+    completed_steps: raw.completed_steps || [],
+    provenance_mode: raw.provenance_mode,
+    llm_provider: raw.llm_provider,
+    limitations_and_boundary_warning: raw.limitations_and_boundary_warning,
+    structured_synthesis: synthesis,
+    transcriptomic_connectivity: raw.transcriptomic_connectivity || null,
+    clinical_trial_challenge: raw.clinical_trial_challenge || null,
+  };
+};
+
 export const repurposingService = {
   getDiseases: () => api.get('/candidates'),
   analyze: async (query, minEvidence = 'all', searchType = 'drug_to_disease') => {
     const cleanQuery = encodeURIComponent(query.trim());
     const cleanSearchType = encodeURIComponent(searchType || 'drug_to_disease');
     const raw = await api.post(`/candidates/investigate?query=${cleanQuery}&search_type=${cleanSearchType}`, {});
-    const synthesis = raw.structured_synthesis || {};
-    const effectiveSearchType = raw.search_type || searchType;
-    const isDrugFirst = effectiveSearchType === 'drug_to_disease' || raw.query_type === 'drug';
-
-    return {
-      analysis_id: raw.workflow_id,
-      workflow_id: raw.workflow_id,
-      query: query,
-      search_type: effectiveSearchType,
-      query_type: raw.query_type || (isDrugFirst ? 'drug' : 'disease'),
-      disease_detected: isDrugFirst ? (raw.candidate_hypotheses?.[0]?.disease_name || 'Multiple Indications') : raw.query_entity,
-      query_entity: raw.query_entity,
-      queried_entity: raw.queried_entity || { name: raw.query_entity, type: raw.entity_type, query_type: raw.query_type },
-      entity_type: raw.entity_type,
-      ml_prediction_metadata: raw.ml_prediction_metadata || {},
-      candidates: (raw.candidate_hypotheses || []).map((c, idx) => {
-        const candidateDisplayName = isDrugFirst ? (c.disease_name || c.candidate_name) : (c.drug_name || c.candidate_name);
-        const subtitle = isDrugFirst
-          ? `Investigated Drug: ${c.drug_name || raw.query_entity}`
-          : (c.approval_status || 'Preclinical Repurposing Hypothesis');
-
-        return {
-          id: c.id,
-          candidate_name: candidateDisplayName,
-          candidate_label: isDrugFirst ? 'Proposed Indication' : 'Candidate Drug',
-          drug_name: c.drug_name,
-          disease_name: c.disease_name,
-          original_indication: isDrugFirst ? (c.approval_status || 'Proposed Indication') : (c.approval_status || 'Preclinical Repurposing Hypothesis'),
-          display_title: candidateDisplayName,
-          display_subtitle: subtitle,
-          curenova_ranking: c.prediction_score != null ? Math.round(c.prediction_score * 100) : null,
-          prediction_score: c.prediction_score,
-          score_type: c.score_type,
-          ml_score_available: c.ml_score_available !== false && c.score_type !== 'curated_evidence_benchmark',
-          confidence_interval: c.confidence_interval_low != null && c.confidence_interval_high != null
-            ? `[${c.confidence_interval_low.toFixed(2)}, ${c.confidence_interval_high.toFixed(2)}]`
-            : 'N/A',
-          confidence_interval_low: c.confidence_interval_low,
-          confidence_interval_high: c.confidence_interval_high,
-          evidence_strength: c.evidence_count >= 3 ? 'high' : c.evidence_count >= 1 ? 'moderate' : 'low',
-          evidence_count: c.evidence_count,
-          mechanism_summary: c.rationale || c.biological_mechanism || synthesis.proposed_mechanism || 'Target kinase signaling modulation',
-          biological_mechanism: c.biological_mechanism,
-          evidence_passages: synthesis.validated_citations || [],
-          safety_signals: synthesis.safety_concerns || [],
-          missing_data: synthesis.missing_information || [],
-          epistemic_uncertainty: c.epistemic_uncertainty,
-          aleatoric_uncertainty: c.aleatoric_uncertainty,
-          calibration_status: c.calibration_status,
-          is_bookmarked: c.is_bookmarked,
-          rank: c.rank || idx + 1,
-          status: c.status,
-        };
-      }),
-      synthesis_report: raw.synthesis_report,
-      completed_steps: raw.completed_steps || [],
-      provenance_mode: raw.provenance_mode,
-      llm_provider: raw.llm_provider,
-      limitations_and_boundary_warning: raw.limitations_and_boundary_warning,
-      structured_synthesis: synthesis,
-    };
+    return formatInvestigationResponse(raw, query, searchType);
   },
   getResult: (id) => api.get(`/candidates/${id}`),
-  getInvestigation: (workflowId) => api.get(`/candidates/investigation/${workflowId}`),
+  getInvestigation: async (workflowId) => {
+    const raw = await api.get(`/candidates/investigation/${workflowId}`);
+    return formatInvestigationResponse(raw, raw.query_entity || raw.workflow_id, raw.search_type);
+  },
   listInvestigations: (limit = 20) => api.get('/candidates/investigations', { params: { limit } }),
+  downloadCandidateReport: (candidateId) =>
+    api.get(`/reports/candidate/${candidateId}/markdown`, { responseType: 'blob' }),
+  downloadInvestigationReport: (workflowId) =>
+    api.get(`/reports/investigation/${workflowId}/markdown`, { responseType: 'blob' }),
   toggleBookmark: (id) => api.post(`/candidates/${id}/bookmark`),
   addNote: (candidateId, content) => api.post(`/candidates/${candidateId}/notes`, { content }),
   deleteNote: (noteId) => api.delete(`/candidates/notes/${noteId}`),

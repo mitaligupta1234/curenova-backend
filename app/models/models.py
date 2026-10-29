@@ -109,6 +109,14 @@ class CandidatePrediction(Base):
     is_bookmarked = Column(Boolean, default=False)
     last_updated = Column(DateTime, default=utc_now)
 
+    # Persistence & Provenance linking
+    investigation_id = Column(Integer, ForeignKey("investigation_runs.id"), nullable=True, index=True)
+    workflow_id = Column(String(100), index=True, nullable=True)
+    score_type = Column(String(50), default="ranking_score")
+    provenance = Column(String(100), default="precomputed_feature_store")
+    molecular_features_json = Column(Text, nullable=True)
+
+    investigation = relationship("InvestigationRun", back_populates="candidates")
     evidence_records = relationship("EvidenceRecord", back_populates="candidate", cascade="all, delete-orphan")
     notes = relationship("ResearchNote", back_populates="candidate", cascade="all, delete-orphan")
 
@@ -244,9 +252,15 @@ class InvestigationRun(Base):
     top_candidate_name = Column(String(255), nullable=True)
     top_candidate_score = Column(Float, nullable=True)
     results_json = Column(Text, nullable=False)  # JSON payload of AgentWorkflowResponse
+    search_type = Column(String(50), default="drug_to_disease")
+    status = Column(String(50), default="completed", index=True)
+    execution_duration_ms = Column(Integer, nullable=True)
+    model_version = Column(String(50), default="cure-nova-xgb-final")
+    error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=utc_now)
 
     user = relationship("User")
+    candidates = relationship("CandidatePrediction", back_populates="investigation", cascade="all, delete-orphan")
 
 class PatientMedication(Base):
     __tablename__ = "patient_medications"

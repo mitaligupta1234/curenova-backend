@@ -23,9 +23,15 @@ def get_candidates(
     min_score: Optional[float] = None,
     bookmarked_only: Optional[bool] = False,
     sort_by: Optional[str] = "rank",  # rank, score, evidence, uncertainty
+    investigation_id: Optional[int] = None,
+    workflow_id: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
     query = db.query(CandidatePrediction)
+    if investigation_id is not None:
+        query = query.filter(CandidatePrediction.investigation_id == investigation_id)
+    if workflow_id:
+        query = query.filter(CandidatePrediction.workflow_id == workflow_id)
     if disease:
         query = query.filter(CandidatePrediction.disease_name.ilike(f"%{disease}%"))
     if drug:
@@ -95,14 +101,29 @@ def list_investigations(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
 ):
-    """Returns past persisted investigation runs."""
-    runs = db.query(InvestigationRun).order_by(InvestigationRun.created_at.desc()).limit(limit).all()
+    """
+    Returns past persisted investigation runs.
+    Restricted to researcher/admin. If researcher, only returns runs belonging to that user
+    (or unassigned demo runs if user_id is None). Admin sees all.
+    """
+    query = db.query(InvestigationRun)
+    if current_user.role != "admin":
+        query = query.filter(
+            (InvestigationRun.user_id == current_user.id) | (InvestigationRun.user_id == None)
+        )
+    runs = query.order_by(InvestigationRun.created_at.desc()).limit(limit).all()
     return [
         {
+            "id": r.id,
             "workflow_id": r.workflow_id,
             "query": r.query,
             "entity_resolved_name": r.entity_resolved_name,
             "entity_type": r.entity_type,
+            "search_type": r.search_type or "drug_to_disease",
+            "status": r.status or "completed",
+            "execution_duration_ms": r.execution_duration_ms,
+            "model_version": r.model_version or "cure-nova-xgb-final",
+            "error_message": r.error_message,
             "candidate_count": r.candidate_count,
             "top_candidate_name": r.top_candidate_name,
             "top_candidate_score": r.top_candidate_score,
@@ -119,12 +140,18 @@ def get_investigation_by_id(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
 ):
-    """Retrieves a previously computed investigation run by workflow_id."""
+    """Retrieves a previously computed investigation run by workflow_id, enforcing authorization."""
     run = db.query(InvestigationRun).filter(InvestigationRun.workflow_id == workflow_id).first()
     if not run:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Investigation run '{workflow_id}' not found."
+        )
+    # Check authorization: user must be admin or the owner (or run is unassigned demo run)
+    if current_user.role != "admin" and run.user_id is not None and run.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: You do not have permission to access another researcher's private investigation."
         )
     try:
         return json.loads(run.results_json)

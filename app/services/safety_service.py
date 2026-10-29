@@ -99,10 +99,14 @@ class MultiDrugSafetyService:
                 "summary_headline": "At least 2 distinct medications are required to perform drug-drug interaction profiling.",
                 "total_medications": med_count,
                 "evaluated_medications": unique_meds,
+                "total_pairs_evaluated": 0,
                 "pairwise_interactions": [],
                 "unmonitored_pairs": [],
                 "contraindications_count": 0,
                 "major_interactions_count": 0,
+                "moderate_interactions_count": 0,
+                "minor_interactions_count": 0,
+                "patient_context": patient_context,
                 "safety_disclaimer": (
                     "Polypharmacy risk analysis requires evaluating multiple concurrent medications. "
                     "Single-agent toxicology should be reviewed via standard product monographs."

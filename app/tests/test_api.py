@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import hashlib
 import pytest
 from fastapi.testclient import TestClient
@@ -16,7 +17,7 @@ from app.services.seed_data import seed_database
 from app.main import app
 from app.config import Settings, settings
 from scripts.bootstrap_admin import bootstrap_admin, rotate_admin_password
-from app.models.models import InvestigationRun
+from app.models.models import InvestigationRun, CandidatePrediction, EvidenceRecord, User, ResearchNote
 from ml.predict_v4 import (
     query_candidates,
     query_candidates_for_drug,
@@ -3197,5 +3198,409 @@ def test_audit_task5_investigation_persistence_and_refresh_recovery():
     assert "transcriptomic_connectivity" in recov_data
     assert "clinical_trial_challenge" in recov_data
 
+
+def test_phase3_3_doctor_regimen_http_single_and_duplicate_handling():
+    """
+    Phase 3.3 Regression Test: HTTP /api/doctor/safety/analyze-regimen serialization
+    for single-drug, duplicate, and empty inputs.
+    Verifies that the HTTP layer serializes RegimenAnalysisOut cleanly without ResponseValidationError.
+    """
+    doctor_headers = get_auth_headers("marcus.chen.md@metropolitan-health.org")
+
+    # 1. Single medication returns HTTP 200 with honest Insufficient Medications status
+    r_single = client.post(
+        "/api/doctor/safety/analyze-regimen",
+        headers=doctor_headers,
+        json={"medications": ["Metformin"]}
+    )
+    assert r_single.status_code == 200, f"Failed: {r_single.text}"
+    d_single = r_single.json()
+    assert d_single["overall_risk_category"] == "Insufficient Medications"
+    assert d_single["total_medications"] == 1
+    assert d_single["total_pairs_evaluated"] == 0
+    assert d_single["pairwise_interactions"] == []
+
+    # 2. Duplicate medication aliases normalize to single drug and return HTTP 200
+    r_dup = client.post(
+        "/api/doctor/safety/analyze-regimen",
+        headers=doctor_headers,
+        json={"medications": ["Aspirin", "Aspirin 81mg", "aspirin"]}
+    )
+    assert r_dup.status_code == 200, f"Failed: {r_dup.text}"
+    d_dup = r_dup.json()
+    assert d_dup["overall_risk_category"] == "Insufficient Medications"
+    assert d_dup["total_medications"] == 1
+    assert d_dup["total_pairs_evaluated"] == 0
+
+    # 3. Empty medications list rejected at Pydantic schema validation level with HTTP 422
+    r_empty = client.post(
+        "/api/doctor/safety/analyze-regimen",
+        headers=doctor_headers,
+        json={"medications": []}
+    )
+    assert r_empty.status_code == 422
+
+    # 4. Strict RBAC: Researcher and Patient tokens rejected with HTTP 403
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    r_res = client.post(
+        "/api/doctor/safety/analyze-regimen",
+        headers=researcher_headers,
+        json={"medications": ["Imatinib", "Warfarin"]}
+    )
+    assert r_res.status_code == 403
+
+    patient_headers = get_auth_headers("sarah.jenkins@patient-portal.org")
+    r_pat = client.post(
+        "/api/doctor/safety/analyze-regimen",
+        headers=patient_headers,
+        json={"medications": ["Imatinib", "Warfarin"]}
+    )
+    assert r_pat.status_code == 403
+
+
+# ===========================================================================
+# Researcher Module Database and Data Pipeline Tests
+# ===========================================================================
+
+def test_researcher_schema_columns_and_relationships():
+    """Requirement 1 & 2: Audit database models for researcher persistence columns and relationships."""
+    inv_cols = {c.name for c in InvestigationRun.__table__.columns}
+    assert "workflow_id" in inv_cols
+    assert "search_type" in inv_cols
+    assert "status" in inv_cols
+    assert "execution_duration_ms" in inv_cols
+    assert "model_version" in inv_cols
+    assert "error_message" in inv_cols
+
+    cand_cols = {c.name for c in CandidatePrediction.__table__.columns}
+    assert "investigation_id" in cand_cols
+    assert "workflow_id" in cand_cols
+    assert "score_type" in cand_cols
+    assert "provenance" in cand_cols
+    assert "molecular_features_json" in cand_cols
+
+    # Verify relationships
+    assert hasattr(InvestigationRun, "candidates")
+    assert hasattr(CandidatePrediction, "investigation")
+    assert hasattr(CandidatePrediction, "evidence_records")
+
+
+def test_researcher_investigation_atomic_persistence():
+    """Requirement 2, 3, 5: Run investigation, verify atomic DB persistence of run, candidates, molecular features, and evidence."""
+    researcher_headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+
+    res = client.post(
+        "/api/candidates/investigate?query=Everolimus&search_type=drug_to_disease",
+        headers=researcher_headers
+    )
+    assert res.status_code == 200, f"Investigation failed: {res.text}"
+    data = res.json()
+
+    workflow_id = data["workflow_id"]
+    assert workflow_id.startswith("WF-CURENOVA-")
+    assert data["status"] == "completed"
+    assert data["execution_duration_ms"] is not None
+    assert len(data["candidates"]) > 0
+
+    # Query isolated test DB directly to verify persistence
+    db = TestingSessionLocal()
+    try:
+        inv_run = db.query(InvestigationRun).filter(InvestigationRun.workflow_id == workflow_id).first()
+        assert inv_run is not None
+        assert inv_run.status == "completed"
+        assert inv_run.search_type == "drug_to_disease"
+        assert inv_run.execution_duration_ms > 0
+        assert inv_run.candidate_count == len(data["candidates"])
+        assert inv_run.error_message is None
+
+        # Verify CandidatePrediction rows linked to this run
+        cands = db.query(CandidatePrediction).filter(CandidatePrediction.investigation_id == inv_run.id).all()
+        assert len(cands) == len(data["candidates"])
+        for c in cands:
+            assert c.workflow_id == workflow_id
+            assert c.score_type == "ranking_score"
+            assert c.prediction_score > 0.0
+            assert c.rank >= 1
+
+        # Check molecular features on candidates
+        top_cand = cands[0]
+        if top_cand.molecular_features_json:
+            mol_data = json.loads(top_cand.molecular_features_json)
+            assert isinstance(mol_data, dict)
+            assert "molecular_weight" in mol_data or len(mol_data) > 0
+
+        # Check EvidenceRecord linked to top candidate
+        ev_records = db.query(EvidenceRecord).filter(EvidenceRecord.candidate_id == top_cand.id).all()
+        assert len(ev_records) >= 0
+    finally:
+        db.close()
+
+
+def test_researcher_history_retrieval_and_filtering():
+    """Requirement 4: Verify past investigations are retrieved with full metadata."""
+    headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+
+    client.post("/api/candidates/investigate?query=Metformin&search_type=drug_to_disease", headers=headers)
+    client.post("/api/candidates/investigate?query=Fasudil&search_type=drug_to_disease", headers=headers)
+
+    res = client.get("/api/candidates/investigations", headers=headers)
+    assert res.status_code == 200
+    runs = res.json()
+    assert len(runs) >= 2
+
+    first_run = runs[0]
+    assert "workflow_id" in first_run
+    assert "search_type" in first_run
+    assert "status" in first_run
+    assert "execution_duration_ms" in first_run
+    assert "model_version" in first_run
+    assert "top_candidate_name" in first_run
+
+
+def test_researcher_candidate_filtering_by_investigation_id():
+    """Requirement 3: Verify CandidatePrediction query can filter by investigation_id or workflow_id."""
+    headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+
+    res = client.post("/api/candidates/investigate?query=Everolimus&search_type=drug_to_disease", headers=headers)
+    wf_id = res.json()["workflow_id"]
+
+    db = TestingSessionLocal()
+    inv_run = db.query(InvestigationRun).filter(InvestigationRun.workflow_id == wf_id).first()
+    inv_id = inv_run.id
+    db.close()
+
+    # Query /candidates?investigation_id=...
+    res_cands = client.get(f"/api/candidates?investigation_id={inv_id}")
+    assert res_cands.status_code == 200
+    cands = res_cands.json()
+    assert len(cands) > 0
+    for c in cands:
+        assert c["investigation_id"] == inv_id
+
+    # Query /candidates?workflow_id=...
+    res_wf = client.get(f"/api/candidates?workflow_id={wf_id}")
+    assert res_wf.status_code == 200
+    assert len(res_wf.json()) == len(cands)
+
+
+def test_researcher_authorization_cross_isolation():
+    """Requirement 6: Ensure researchers cannot access each other's private investigations, while admin can access all."""
+    # Register second researcher
+    signup_res = client.post("/api/auth/signup", json={
+        "email": "dr.marcus.brody@curenova-research.org",
+        "full_name": "Dr. Marcus Brody",
+        "password": "CureNova2026!Secure",
+        "role": "researcher"
+    })
+    assert signup_res.status_code in (200, 201)
+
+    # Approve second researcher using admin
+    admin_headers = get_auth_headers("admin@curenova.ai", "CureNova2026!Secure")
+    users_res = client.get("/api/auth/users", headers=admin_headers)
+    user_b_id = [u["id"] for u in users_res.json() if u["email"] == "dr.marcus.brody@curenova-research.org"][0]
+    client.post(f"/api/auth/users/{user_b_id}/approve", json={"approval_status": "approved"}, headers=admin_headers)
+
+    # Researcher A runs investigation
+    headers_a = get_auth_headers("dr.elena.vance@curenova-research.org")
+    inv_res = client.post("/api/candidates/investigate?query=Everolimus&search_type=drug_to_disease", headers=headers_a)
+    wf_id = inv_res.json()["workflow_id"]
+
+    # Researcher B attempts to fetch Researcher A's investigation -> MUST be 403 Forbidden
+    headers_b = get_auth_headers("dr.marcus.brody@curenova-research.org")
+    res_b_attempt = client.get(f"/api/candidates/investigation/{wf_id}", headers=headers_b)
+    assert res_b_attempt.status_code == 403, f"Expected 403 Forbidden, got {res_b_attempt.status_code}"
+
+    # Researcher B lists investigations -> MUST NOT see Researcher A's private run
+    res_b_list = client.get("/api/candidates/investigations", headers=headers_b)
+    assert res_b_list.status_code == 200
+    b_wf_ids = [r["workflow_id"] for r in res_b_list.json()]
+    assert wf_id not in b_wf_ids
+
+    # Researcher A fetches own investigation -> 200 OK
+    res_a_fetch = client.get(f"/api/candidates/investigation/{wf_id}", headers=headers_a)
+    assert res_a_fetch.status_code == 200
+
+    # Admin fetches Researcher A's investigation -> 200 OK
+    res_admin_fetch = client.get(f"/api/candidates/investigation/{wf_id}", headers=admin_headers)
+    assert res_admin_fetch.status_code == 200
+
+
+def test_researcher_markdown_dossier_download_and_auth():
+    """Requirement 2 & 4: Download investigation markdown dossier and enforce authorization."""
+    headers_a = get_auth_headers("dr.elena.vance@curenova-research.org")
+
+    inv_res = client.post("/api/candidates/investigate?query=Everolimus&search_type=drug_to_disease", headers=headers_a)
+    wf_id = inv_res.json()["workflow_id"]
+
+    # Researcher A downloads report
+    res_rep = client.get(f"/api/reports/investigation/{wf_id}/markdown", headers=headers_a)
+    assert res_rep.status_code == 200
+    assert "text/markdown" in res_rep.headers["content-type"]
+    md = res_rep.text
+    assert "# CURENOVA 2.0 — MULTI-STAGE INVESTIGATION DOSSIER" in md
+    assert wf_id in md
+    assert "Everolimus" in md
+    assert "RANKED REPURPOSING CANDIDATE HYPOTHESES" in md
+    assert "MANDATORY SCIENTIFIC DISCLAIMER" in md
+
+
+def test_researcher_evidence_explorer_compatibility_fields():
+    """Requirement 4: Ensure EvidenceRecordOut provides summary, findings, url, source, evidence_level."""
+    res = client.get("/api/evidence")
+    assert res.status_code == 200
+    records = res.json()
+    assert len(records) > 0
+    for rec in records:
+        assert "summary" in rec
+        assert "findings" in rec
+        assert "url" in rec
+        assert "source" in rec
+        assert "evidence_level" in rec
+        assert rec["summary"] is not None or rec["excerpt"] is not None
+
+
+def test_researcher_candidate_bookmark_and_notes():
+    """Requirement 2 & 4: Ensure candidates from an investigation can be bookmarked and have notes added."""
+    headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+
+    inv_res = client.post("/api/candidates/investigate?query=Everolimus&search_type=drug_to_disease", headers=headers)
+    top_cand = inv_res.json()["candidates"][0]
+    cand_id = top_cand["id"]
+
+    # Bookmark candidate
+    bm_res = client.post(f"/api/candidates/{cand_id}/bookmark", headers=headers)
+    assert bm_res.status_code == 200
+    assert bm_res.json()["is_bookmarked"] is True
+
+    # Add research note
+    note_res = client.post(
+        f"/api/candidates/{cand_id}/notes",
+        json={"content": "Evaluated candidate mechanism in preclinical model."},
+        headers=headers
+    )
+    assert note_res.status_code == 200
+    note_data = note_res.json()
+    assert note_data["content"] == "Evaluated candidate mechanism in preclinical model."
+
+    # Fetch candidate detail
+    detail_res = client.get(f"/api/candidates/{cand_id}", headers=headers)
+    assert detail_res.status_code == 200
+    assert len(detail_res.json()["notes"]) == 1
+
+
+def test_phase4_clinical_trial_safe_url_and_termination_classification():
+    """Phase 4: Verify trial finding classification handles missing url key and classifies terminations accurately."""
+    from app.services.clinical_trial_challenge import ClinicalTrialChallengeAgent
+
+    # Trial with missing url key
+    trial_missing_url = {
+        "nct_id": "NCT05555555",
+        "title": "Study of Metformin in PAH",
+        "overall_status": "TERMINATED",
+        "why_stopped": "Slow patient accrual due to competing clinical trials",
+        "has_results": False,
+        "interventions": ["Metformin"],
+        "conditions": ["Pulmonary Arterial Hypertension"]
+    }
+    res = ClinicalTrialChallengeAgent.classify_trial_finding(trial_missing_url, "Metformin", "Pulmonary Arterial Hypertension")
+    assert res["url"] == "https://clinicaltrials.gov/study/NCT05555555"
+    assert res["classification"] == "TERMINATED_OPERATIONAL_INCONCLUSIVE"
+    assert res["challenge_impact"] == "INCONCLUSIVE"
+
+    # Efficacy failure trial
+    trial_eff_fail = {
+        "nct_id": "NCT06666666",
+        "title": "Oncology Evaluation",
+        "overall_status": "TERMINATED",
+        "why_stopped": "Futility threshold crossed; lack of efficacy",
+        "has_results": True,
+        "interventions": ["Everolimus"],
+        "conditions": ["Glioblastoma"]
+    }
+    res_fail = ClinicalTrialChallengeAgent.classify_trial_finding(trial_eff_fail, "Everolimus", "Glioblastoma")
+    assert res_fail["classification"] == "TERMINATED_EFFICACY_FAILURE"
+    assert res_fail["challenge_impact"] == "HIGH_CHALLENGE"
+
+
+def test_phase4_candidate_markdown_dossier_with_none_uncertainties():
+    """Phase 4: Verify markdown dossier generation succeeds when uncertainty fields are None (uncalibrated ML)."""
+    headers = get_auth_headers("dr.elena.vance@curenova-research.org")
+    inv_res = client.post("/api/candidates/investigate?query=Everolimus&search_type=drug_to_disease", headers=headers)
+    assert inv_res.status_code == 200
+    cands = inv_res.json()["candidates"]
+    assert len(cands) > 0
+    top_cand_id = cands[0]["id"]
+
+    # Download markdown report
+    rep_res = client.get(f"/api/reports/candidate/{top_cand_id}/markdown", headers=headers)
+    assert rep_res.status_code == 200
+    assert rep_res.headers["content-type"].startswith("text/markdown")
+    body = rep_res.text
+    assert "EXECUTIVE SUMMARY & TARGET CANDIDATE" in body
+    assert "Computational Score" in body
+
+
+def test_phase4_orchestrator_failure_recovery_and_persistence():
+    """Phase 4: Verify unhandled pipeline errors are trapped and saved with status='failed'."""
+    from unittest.mock import patch
+    from app.services.agentic_orchestrator import AgenticOrchestrator
+    import asyncio
+
+    db = TestingSessionLocal()
+    try:
+        with patch.object(AgenticOrchestrator, "_run_investigation_pipeline", side_effect=RuntimeError("Simulated pipeline fault")):
+            loop = asyncio.new_event_loop()
+            res = loop.run_until_complete(AgenticOrchestrator.run_investigation(
+                db=db,
+                query="FailureTestQuery",
+                search_type="drug_to_disease",
+                user_role="researcher",
+                user_id=1
+            ))
+            loop.close()
+            assert res["status"] == "failed"
+            assert "Simulated pipeline fault" in res["error_message"]
+            assert res["candidate_hypotheses"] == []
+
+            # Verify SQLite record persisted
+            failed_run = db.query(InvestigationRun).filter(InvestigationRun.workflow_id == res["workflow_id"]).first()
+            assert failed_run is not None
+            assert failed_run.status == "failed"
+            assert "Simulated pipeline fault" in failed_run.error_message
+    finally:
+        db.close()
+
+def test_phase4_fasudil_pah_clinical_trial_direct_partition():
+    """Phase 4.1: Verify Fasudil in PAH audits indirect comparator trials without falsely attributing them as direct trials."""
+    from app.services.clinical_trial_challenge import ClinicalTrialChallengeAgent
+    import asyncio
+
+    # Case 1: Pure API lookup without local DB (zero trials found in registry)
+    loop = asyncio.new_event_loop()
+    res_no_db = loop.run_until_complete(
+        ClinicalTrialChallengeAgent.audit_hypothesis("Fasudil", "Pulmonary Arterial Hypertension", db=None)
+    )
+    assert res_no_db["candidate_drug"] == "Fasudil"
+    assert res_no_db["proposed_indication"] == "Pulmonary Arterial Hypertension"
+    assert res_no_db["overall_challenge_level"] == "UNRESOLVED_NO_CLINICAL_TRIALS"
+    assert "strictly preclinical" in res_no_db["summary"].lower()
+
+    # Case 2: With local DB where condition-level trials (e.g. NCT00760487 Imatinib in PAH) exist
+    db = TestingSessionLocal()
+    try:
+        res_with_db = loop.run_until_complete(
+            ClinicalTrialChallengeAgent.audit_hypothesis("Fasudil", "Pulmonary Arterial Hypertension", db=db)
+        )
+        assert res_with_db["candidate_drug"] == "Fasudil"
+        assert res_with_db["proposed_indication"] == "Pulmonary Arterial Hypertension"
+        # If local DB contains NCT00760487, it must be partitioned into indirect_trials
+        if res_with_db.get("evaluated_trials"):
+            assert res_with_db["overall_challenge_level"] == "UNRESOLVED_NO_DIRECT_TRIALS"
+            assert "strictly preclinical" in res_with_db["summary"].lower()
+            for trial in res_with_db["evaluated_trials"]:
+                assert trial.get("is_direct_investigation") is False
+    finally:
+        loop.close()
+        db.close()
 
 

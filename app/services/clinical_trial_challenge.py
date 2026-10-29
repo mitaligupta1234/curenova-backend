@@ -297,9 +297,10 @@ class ClinicalTrialChallengeAgent:
             challenge_impact = "NEUTRAL"
             explanation = f"Trial {trial['nct_id']} is currently in status '{status}'."
 
+        nct_id = trial.get("nct_id", "NCT_UNKNOWN")
         return {
-            "nct_id": trial["nct_id"],
-            "title": trial["title"],
+            "nct_id": nct_id,
+            "title": trial.get("title", ""),
             "status": status,
             "phases": trial.get("phases", []),
             "why_stopped": trial.get("why_stopped"),
@@ -308,7 +309,7 @@ class ClinicalTrialChallengeAgent:
             "challenge_impact": challenge_impact,
             "explanation": explanation,
             "primary_outcomes": trial.get("primary_outcomes", [])[:3],
-            "url": trial["url"],
+            "url": trial.get("url") or (f"https://clinicaltrials.gov/study/{nct_id}" if nct_id else None),
             "source": trial.get("source", "ClinicalTrials.gov")
         }
 
@@ -343,11 +344,14 @@ class ClinicalTrialChallengeAgent:
             classified = cls.classify_trial_finding(t, candidate_drug, proposed_indication)
             evaluated_trials.append(classified)
 
-        # Determine overall challenge classification
-        has_efficacy_failure = any(t["classification"] == "TERMINATED_EFFICACY_FAILURE" for t in evaluated_trials)
-        has_active_trials = any(t["challenge_impact"] == "SUPPORTIVE_INVESTIGATIONAL" for t in evaluated_trials)
-        has_completed_trials = any("COMPLETED" in t["classification"] for t in evaluated_trials)
-        has_inconclusive_term = any(t["classification"] == "TERMINATED_OPERATIONAL_INCONCLUSIVE" for t in evaluated_trials)
+        # Partition into direct drug-indication trials vs related disease context trials
+        direct_trials = [t for t in evaluated_trials if t.get("is_direct_investigation")]
+        indirect_trials = [t for t in evaluated_trials if not t.get("is_direct_investigation")]
+
+        has_efficacy_failure = any(t["classification"] == "TERMINATED_EFFICACY_FAILURE" for t in direct_trials)
+        has_active_trials = any(t["challenge_impact"] == "SUPPORTIVE_INVESTIGATIONAL" for t in direct_trials)
+        has_completed_trials = any("COMPLETED" in t["classification"] for t in direct_trials)
+        has_inconclusive_term = any(t["classification"] == "TERMINATED_OPERATIONAL_INCONCLUSIVE" for t in direct_trials)
 
         if has_efficacy_failure:
             overall_challenge_level = "HIGH_ADVERSARIAL_CHALLENGE"
@@ -358,24 +362,32 @@ class ClinicalTrialChallengeAgent:
         elif has_completed_trials or has_active_trials:
             overall_challenge_level = "SUPPORTIVE_OR_EVALUATED"
             summary = (
-                f"Identified {len(evaluated_trials)} clinical trial(s) investigating {candidate_drug} in connection with {proposed_indication}. "
+                f"Identified {len(direct_trials)} clinical trial(s) directly investigating {candidate_drug} in connection with {proposed_indication}. "
                 "No documented termination due to inefficacy detected."
             )
         elif has_inconclusive_term:
             overall_challenge_level = "INCONCLUSIVE_HISTORICAL_EVIDENCE"
             summary = (
-                f"Clinical trial was previously terminated for operational/enrollment reasons. "
+                f"Clinical trial directly evaluating {candidate_drug} in {proposed_indication} was previously terminated for operational/enrollment reasons. "
                 "Findings are inconclusive and do not refute biological plausibility."
             )
-        elif not evaluated_trials:
-            overall_challenge_level = "UNRESOLVED_NO_CLINICAL_TRIALS"
-            summary = (
-                f"No registered clinical trials found evaluating '{candidate_drug}' for '{proposed_indication}' in ClinicalTrials.gov. "
-                "Hypothesis remains strictly preclinical."
-            )
+        elif not direct_trials:
+            if indirect_trials:
+                overall_challenge_level = "UNRESOLVED_NO_DIRECT_TRIALS"
+                summary = (
+                    f"No registered clinical trials found directly evaluating '{candidate_drug}' for '{proposed_indication}' in ClinicalTrials.gov. "
+                    f"Found {len(indirect_trials)} related trial(s) for the condition (e.g., {indirect_trials[0].get('title', 'comparator trial')}). "
+                    "Hypothesis remains strictly preclinical."
+                )
+            else:
+                overall_challenge_level = "UNRESOLVED_NO_CLINICAL_TRIALS"
+                summary = (
+                    f"No registered clinical trials found evaluating '{candidate_drug}' for '{proposed_indication}' in ClinicalTrials.gov. "
+                    "Hypothesis remains strictly preclinical."
+                )
         else:
             overall_challenge_level = "INCONCLUSIVE"
-            summary = f"Evaluated {len(evaluated_trials)} trial records; findings are inconclusive."
+            summary = f"Evaluated {len(direct_trials)} direct trial records; findings are inconclusive."
 
         return {
             "candidate_drug": candidate_drug,

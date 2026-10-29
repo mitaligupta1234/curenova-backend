@@ -1,0 +1,41 @@
+# CureNova 2.0 Docker Ignore
+# Exclude sensitive data, local virtual environments, database files, and caches
+
+# Virtual environments
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Database files (DO NOT embed local database into image)
+curenova.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment files with secrets
+.env
+.env.local
+.env.production
+*.pem
+*.key
+
+# Git and IDE
+.git/
+.gitignore
+.gemini/
+.idea/
+.vscode/
+
+# Testing and cache
+.pytest_cache/
+.coverage
+htmlcov/
+scratch/
+
+# Frontend build artifacts and node dependencies
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
